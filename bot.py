@@ -80,10 +80,10 @@ openai.api_key = DEEPSEEK_API_KEY
 # ===== КОНСТАНТЫ =====
 MAX_HISTORY = 30
 SESSION_DURATION = 45 * 60          # 45 минут (не используется, оставлено для совместимости)
-COOLDOWN_SECONDS = 1 * 60 * 1     # 24 часа
+COOLDOWN_SECONDS = 12 * 60 * 60     # 24 часа
 
 END_MESSAGE = (
-    "🕊️ Сеанс завершён. Чтобы начать новый, нажмите «Начать сессию»."
+    "🕊️"
 )
 
 DEFAULT_WELCOME = (
@@ -562,7 +562,7 @@ async def send_invoice(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None
         invoice_message = await context.bot.send_invoice(
             chat_id=chat_id,
             title="Оплата сессии",
-            description="Одна консультация (45 минут).",
+            description="Один расклад ТАРО",
             payload="session_payment",
             provider_token=PAYMENT_PROVIDER_TOKEN,
             currency=CURRENCY,
