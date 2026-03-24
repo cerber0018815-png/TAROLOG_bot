@@ -670,7 +670,6 @@ async def free_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
-    print(f"💬 Получено сообщение: {user_message}")
 
     if context.user_data.get('awaiting_feedback'):
         feedback_text = user_message
