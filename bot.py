@@ -80,7 +80,7 @@ openai.api_key = DEEPSEEK_API_KEY
 # ===== КОНСТАНТЫ =====
 MAX_HISTORY = 30
 SESSION_DURATION = 45 * 60          # 45 минут (не используется, оставлено для совместимости)
-COOLDOWN_SECONDS = 12 * 60 * 60     # 24 часа
+COOLDOWN_SECONDS = 1 * 60 * 1     # 24 часа
 
 END_MESSAGE = (
     "🕊️ Сеанс завершён. Чтобы начать новый, нажмите «Начать сессию»."
