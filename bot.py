@@ -95,7 +95,7 @@ END_KEYBOARD = ReplyKeyboardMarkup([["Завершить сессию"]], resize
 
 # Inline-кнопка для бесплатной консультации
 FREE_KEYBOARD = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🎁 Сделать бесплатний расклад", callback_data="free_consultation")]
+    [InlineKeyboardButton("🎁 Сделать бесплатный расклад", callback_data="free_consultation")]
 ])
 
 # ===== КЛАСС ДЛЯ РАБОТЫ С БАЗОЙ ДАННЫХ =====
