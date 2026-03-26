@@ -22,7 +22,7 @@ DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 DATABASE_URL = os.getenv('DATABASE_URL')
 PAYMENT_PROVIDER_TOKEN = os.getenv('PAYMENT_PROVIDER_TOKEN')
 CURRENCY = os.getenv('CURRENCY', 'RUB')
-PRICE = int(os.getenv('PRICE', 15000))
+PRICE = int(os.getenv('PRICE', 10000))
 AUTHOR_CHAT_ID = os.getenv('AUTHOR_CHAT_ID')
 
 USE_AI_WELCOME = os.getenv('USE_AI_WELCOME', 'True').lower() in ('true', '1', 'yes')
