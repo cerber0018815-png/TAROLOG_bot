@@ -33,7 +33,6 @@ FREE_CONSULTATION_ENABLED = os.getenv('FREE_CONSULTATION_ENABLED', 'True').lower
 
 COOLDOWN_SECONDS = 12 * 60 * 60   # 12 часов
 
-# Текст для бесплатной консультации
 FREE_CONSULTATION_TEXT = (
     "✨ Я — виртуальный таролог.✨\n\n"
     "Я работаю с классической колодой Райдера—Уэйта и глубокой символикой.\n\n"
@@ -51,13 +50,11 @@ FREE_CONSULTATION_TEXT = (
     "Готовы заглянуть в себя? 🔮"
 )
 
-# Клавиатуры
 START_KEYBOARD = ReplyKeyboardMarkup([["Начать сессию"]], resize_keyboard=True)
 FREE_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("🎁 Сделать бесплатный расклад", callback_data="free_consultation")]
 ])
 
-# Системный промпт (сокращённый, но функциональный)
 SYSTEM_PROMPT = """
 Ты — профессиональный таролог, специализирующийся на колоде Райдера—Уэйта. Твоя интерпретация опирается на глубокое знание символики, изложенное в книге Эвелин Бюргер и Йоханнеса Фибиг «Символика под микроскопом». Ты понимаешь, что каждая карта имеет и положительное, и отрицательное значение, является зеркалом души кверента и может быть рассмотрена как на субъективном (внутренние процессы), так и на объективном (внешние события) уровнях.
 
@@ -173,7 +170,6 @@ def is_payment_configured():
 LOCK_FILE = "/tmp/tarot_bot.lock"
 
 def acquire_lock():
-    """Создаёт lock-файл, если он не существует. Если существует – завершает работу."""
     try:
         fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_RDWR)
         os.close(fd)
@@ -186,7 +182,6 @@ def acquire_lock():
         sys.exit(1)
 
 def release_lock():
-    """Удаляет lock-файл при завершении."""
     try:
         if os.path.exists(LOCK_FILE):
             os.remove(LOCK_FILE)
@@ -194,7 +189,7 @@ def release_lock():
     except Exception:
         pass
 
-# ========== БАЗА ДАННЫХ (упрощённая) ==========
+# ========== БАЗА ДАННЫХ ==========
 class Database:
     def __init__(self, dsn):
         self.dsn = dsn
@@ -249,6 +244,12 @@ class Database:
                 "SELECT last_session_end FROM users WHERE user_id = $1", user_id
             )
             return row.timestamp() if row else None
+
+    async def reset_database(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute("DROP TABLE IF EXISTS users CASCADE")
+            await self.init_tables()
+        print("✅ База данных сброшена.")
 
 # ========== AI ФУНКЦИИ ==========
 async def generate_welcome_message():
@@ -335,28 +336,24 @@ async def ask_feedback(chat_id, context):
 
 # ========== ОБРАБОТЧИКИ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало работы – кнопка «Начать сессию»."""
     await update.message.reply_text(
         "Добро пожаловать! Нажмите «Начать сессию», чтобы получить расклад.",
         reply_markup=START_KEYBOARD
     )
 
 async def start_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка кнопки «Начать сессию»."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     db: Database = context.bot_data['db']
 
     await db.get_or_create_user(user_id)
 
-    # Если уже есть активная сессия (ожидание вопроса) – не начинаем новую
     if context.user_data.get('waiting_for_question'):
         await update.message.reply_text(
             "Вы уже задаёте вопрос. Напишите его, я готовлю расклад."
         )
         return
 
-    # Бесплатная консультация?
     if FREE_CONSULTATION_ENABLED:
         free_used = await db.is_free_used(user_id)
         if not free_used:
@@ -367,7 +364,6 @@ async def start_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # Проверка кулдауна
     last_end = await db.get_last_session_end(user_id)
     if last_end and (time.time() - last_end) < COOLDOWN_SECONDS:
         remaining = COOLDOWN_SECONDS - (time.time() - last_end)
@@ -381,7 +377,6 @@ async def start_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Если платежи включены, отправляем инвойс
     if is_payment_configured():
         service_text = (
             "✨ Я — виртуальный таролог.✨\n\n"
@@ -398,11 +393,9 @@ async def start_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_invoice(chat_id, context)
         return
 
-    # Если платежи отключены – сразу начинаем сессию
     await start_session_core(chat_id, user_id, context)
 
 async def free_consultation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатия на кнопку бесплатной консультации."""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -418,22 +411,16 @@ async def free_consultation_callback(update: Update, context: ContextTypes.DEFAU
         await query.edit_message_text("У вас уже есть активная сессия. Завершите её.")
         return
 
-    # Записываем, что бесплатная использована
     await db.set_free_used(user_id)
     await query.edit_message_text("Начинаем бесплатную консультацию...")
     await start_session_core(chat_id, user_id, context)
 
 async def start_session_core(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Запуск сессии: приветствие и ожидание вопроса."""
-    db: Database = context.bot_data['db']
-
-    # Генерируем приветствие
     if USE_AI_WELCOME:
         welcome = await generate_welcome_message()
     else:
         welcome = "Задайте свой вопрос, и я вытяну для вас три карты Таро."
 
-    # Отправляем приветствие и переводим бота в режим ожидания вопроса
     await context.bot.send_message(
         chat_id, welcome,
         reply_markup=ReplyKeyboardMarkup([["Завершить сессию"]], resize_keyboard=True)
@@ -441,22 +428,20 @@ async def start_session_core(chat_id: int, user_id: int, context: ContextTypes.D
     context.user_data['waiting_for_question'] = True
     context.user_data['user_id'] = user_id
     context.user_data['chat_id'] = chat_id
-    # Для истории сообщений (просто список пар роль-текст)
     context.user_data['history'] = []
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текстовых сообщений."""
     user_message = update.message.text
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     db: Database = context.bot_data['db']
 
-    # Если пользователь нажал "Завершить сессию" – сбрасываем состояние
     if user_message == "Завершить сессию":
         if context.user_data.get('waiting_for_question'):
             context.user_data.clear()
+            # После ручного завершения показываем клавиатуру с кнопкой "Начать сессию"
             await update.message.reply_text(
-                "Сеанс завершён. Если захотите новый расклад — нажмите «Начать сессию».",
+                "✨",
                 reply_markup=START_KEYBOARD
             )
         else:
@@ -466,9 +451,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # Если мы в режиме ожидания вопроса – обрабатываем
     if context.user_data.get('waiting_for_question'):
-        # Проверяем, что сессия принадлежит этому пользователю
         if context.user_data.get('user_id') != user_id:
             await update.message.reply_text(
                 "Сейчас идёт сессия другого пользователя. Подождите.",
@@ -476,52 +459,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Показываем "печатает"
         await context.bot.send_chat_action(chat_id, action="typing")
 
-        # Получаем историю (сохраняем до 10 последних сообщений)
         history = context.user_data.get('history', [])
         answer = await ask_ai(user_message, history)
 
-        # Сохраняем историю (вопрос и ответ)
         history.append({"role": "user", "content": user_message})
         history.append({"role": "assistant", "content": answer})
-        if len(history) > 10:  # ограничим историю
+        if len(history) > 10:
             history = history[-10:]
         context.user_data['history'] = history
 
-        # Отправляем ответ (разбиваем на части, если длинный)
         if len(answer) > 4096:
             for i in range(0, len(answer), 4096):
                 await update.message.reply_text(answer[i:i+4096])
         else:
             await update.message.reply_text(answer)
 
-        # Завершаем сессию: записываем время, сбрасываем флаг
         await db.update_last_session_end(user_id)
         context.user_data.pop('waiting_for_question', None)
         context.user_data.pop('user_id', None)
         context.user_data.pop('chat_id', None)
         context.user_data.pop('history', None)
 
-        # Предлагаем отзыв
         await ask_feedback(chat_id, context)
 
-        # Возвращаем клавиатуру "Начать сессию"
+        # Вместо длинного сообщения отправляем короткое с клавиатурой "Начать сессию"
         await update.message.reply_text(
-            "Сеанс завершён. Если захотите новый расклад — нажмите «Начать сессию».",
+            "✨",
             reply_markup=START_KEYBOARD
         )
         return
 
-    # Если нет активной сессии
     await update.message.reply_text(
         "Сейчас нет активной сессии. Нажмите «Начать сессию».",
         reply_markup=START_KEYBOARD
     )
 
 async def feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка отзыва через кнопки."""
     query = update.callback_query
     await query.answer()
     if query.data == "feedback_yes":
@@ -531,7 +506,6 @@ async def feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Спасибо! Если захотите оставить отзыв позже, используйте /feedback.")
 
 async def feedback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Приём текста отзыва."""
     if context.user_data.get('awaiting_feedback'):
         feedback = update.message.text
         if AUTHOR_CHAT_ID:
@@ -561,6 +535,20 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     await start_session_core(chat_id, user_id, context)
 
+# ========== КОМАНДА СБРОСА БД ==========
+async def resetdb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if AUTHOR_CHAT_ID and update.effective_user.id != int(AUTHOR_CHAT_ID):
+        await update.message.reply_text("⛔ Недостаточно прав для выполнения этой команды.")
+        return
+
+    db: Database = context.bot_data['db']
+    await update.message.reply_text("⚠️ Сброс базы данных... Это удалит всех пользователей и историю.")
+    try:
+        await db.reset_database()
+        await update.message.reply_text("✅ База данных успешно сброшена.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при сбросе базы: {e}")
+
 # ========== ЗАПУСК ==========
 async def main():
     acquire_lock()
@@ -573,17 +561,16 @@ async def main():
         app = Application.builder().token(TELEGRAM_TOKEN).build()
         app.bot_data['db'] = db
 
-        # Удаляем вебхук, если был
         await app.bot.delete_webhook()
-        # Даём время Telegram обработать запрос
         await asyncio.sleep(1)
-        info = await app.bot.get_webhook_info()
-        if info.url:
-            print(f"⚠️ Вебхук всё ещё установлен: {info.url}. Повторная попытка удаления...")
+        webhook_info = await app.bot.get_webhook_info()
+        if webhook_info.url:
+            print(f"⚠️ Вебхук всё ещё установлен: {webhook_info.url}. Повторная попытка удаления...")
             await app.bot.delete_webhook()
+            await asyncio.sleep(1)
 
-        # Обработчики
         app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("resetdb", resetdb))
         app.add_handler(MessageHandler(filters.Regex("^Начать сессию$"), start_session))
         app.add_handler(CallbackQueryHandler(free_consultation_callback, pattern="^free_consultation$"))
         app.add_handler(PreCheckoutQueryHandler(pre_checkout))
@@ -612,7 +599,6 @@ async def main():
         await db.close()
     finally:
         release_lock()
-        print("✅ Бот остановлен")
 
 if __name__ == "__main__":
     try:
