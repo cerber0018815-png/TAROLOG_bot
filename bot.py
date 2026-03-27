@@ -246,7 +246,7 @@ async def ask_feedback(chat_id, context):
     ]
     await context.bot.send_message(
         chat_id,
-        "Вы можете оставить отзыв о прошедшей сессии.",
+        "Вы можете оставить отзыв если захотите.",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -418,7 +418,7 @@ async def feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if query.data == "feedback_yes":
         context.user_data['awaiting_feedback'] = True
-        await query.edit_message_text("Пожалуйста, напишите ваш отзыв одним сообщением.")
+        await query.edit_message_text("Пожалуйста, напишите ваш отзыв одним сообщением.⤵️")
     else:
         await query.edit_message_text("Спасибо! Если захотите оставить отзыв позже, используйте /feedback.")
 
