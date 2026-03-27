@@ -53,7 +53,6 @@ FREE_CONSULTATION_TEXT = (
 
 # Клавиатуры
 START_KEYBOARD = ReplyKeyboardMarkup([["Начать сессию"]], resize_keyboard=True)
-END_KEYBOARD = ReplyKeyboardMarkup([["Завершить сессию"]], resize_keyboard=True)  # не используется, но оставим
 FREE_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("🎁 Сделать бесплатный расклад", callback_data="free_consultation")]
 ])
@@ -170,29 +169,29 @@ openai.api_key = DEEPSEEK_API_KEY
 def is_payment_configured():
     return PAYMENT_ENABLED and PAYMENT_PROVIDER_TOKEN and ':' in PAYMENT_PROVIDER_TOKEN
 
-# ========== БЛОКИРОВКА PID ==========
-PID_FILE = "/tmp/tarot_bot.pid"
+# ========== БЛОКИРОВКА ЧЕРЕЗ LOCK-ФАЙЛ ==========
+LOCK_FILE = "/tmp/tarot_bot.lock"
 
-def check_and_create_pid():
-    if os.path.exists(PID_FILE):
-        with open(PID_FILE, 'r') as f:
-            old_pid = int(f.read().strip())
-        try:
-            os.kill(old_pid, 0)
-            print(f"❌ Бот уже запущен (PID {old_pid}). Завершаем.")
-            sys.exit(1)
-        except OSError:
-            print(f"⚠️ PID-файл есть, но процесс {old_pid} не жив. Удаляем.")
-            os.remove(PID_FILE)
-    with open(PID_FILE, 'w') as f:
-        f.write(str(os.getpid()))
-    print(f"✅ PID-файл создан: {PID_FILE}")
-
-def remove_pid():
+def acquire_lock():
+    """Создаёт lock-файл, если он не существует. Если существует – завершает работу."""
     try:
-        if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
-    except:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        os.close(fd)
+        print(f"✅ Lock-файл создан: {LOCK_FILE}")
+    except FileExistsError:
+        print("❌ Бот уже запущен (найден lock-файл). Завершение.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Ошибка при создании lock-файла: {e}")
+        sys.exit(1)
+
+def release_lock():
+    """Удаляет lock-файл при завершении."""
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+            print("✅ Lock-файл удалён.")
+    except Exception:
         pass
 
 # ========== БАЗА ДАННЫХ (упрощённая) ==========
@@ -361,7 +360,6 @@ async def start_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if FREE_CONSULTATION_ENABLED:
         free_used = await db.is_free_used(user_id)
         if not free_used:
-            # Предлагаем бесплатную
             await update.message.reply_text(
                 FREE_CONSULTATION_TEXT,
                 parse_mode='Markdown',
@@ -565,50 +563,56 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ========== ЗАПУСК ==========
 async def main():
-    check_and_create_pid()
-    print("🚀 Запуск бота...")
-    db = Database(DATABASE_URL)
-    await db.connect()
-    await db.init_tables()
+    acquire_lock()
+    try:
+        print("🚀 Запуск бота...")
+        db = Database(DATABASE_URL)
+        await db.connect()
+        await db.init_tables()
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.bot_data['db'] = db
+        app = Application.builder().token(TELEGRAM_TOKEN).build()
+        app.bot_data['db'] = db
 
-    # Удаляем вебхук, если был
-    await app.bot.delete_webhook()
+        # Удаляем вебхук, если был
+        await app.bot.delete_webhook()
+        # Даём время Telegram обработать запрос
+        await asyncio.sleep(1)
+        info = await app.bot.get_webhook_info()
+        if info.url:
+            print(f"⚠️ Вебхук всё ещё установлен: {info.url}. Повторная попытка удаления...")
+            await app.bot.delete_webhook()
 
-    # Обработчики
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Regex("^Начать сессию$"), start_session))
-    app.add_handler(CallbackQueryHandler(free_consultation_callback, pattern="^free_consultation$"))
-    app.add_handler(PreCheckoutQueryHandler(pre_checkout))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(feedback_callback, pattern="^feedback_"))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^Завершить сессию$"), handle_message))
+        # Обработчики
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(MessageHandler(filters.Regex("^Начать сессию$"), start_session))
+        app.add_handler(CallbackQueryHandler(free_consultation_callback, pattern="^free_consultation$"))
+        app.add_handler(PreCheckoutQueryHandler(pre_checkout))
+        app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        app.add_handler(CallbackQueryHandler(feedback_callback, pattern="^feedback_"))
+        app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^Завершить сессию$"), handle_message))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_text))
 
-    # Дополнительный обработчик для отзыва (текст)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_text))
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        print("✅ Бот запущен, polling активен")
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    print("✅ Бот запущен, polling активен")
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop_event.set)
 
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop_event.set)
+        await stop_event.wait()
 
-    await stop_event.wait()
-
-    print("🛑 Остановка...")
-    await app.updater.stop()
-    await app.stop()
-    await app.shutdown()
-    await db.close()
-    remove_pid()
-    print("✅ Бот остановлен")
+        print("🛑 Остановка...")
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await db.close()
+    finally:
+        release_lock()
+        print("✅ Бот остановлен")
 
 if __name__ == "__main__":
     try:
