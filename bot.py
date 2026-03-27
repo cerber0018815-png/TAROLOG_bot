@@ -5,6 +5,7 @@ import sys
 import os
 import json
 import signal
+import fcntl                       # <-- добавлен для блокировки
 from datetime import datetime
 from dotenv import load_dotenv
 import asyncpg
@@ -71,7 +72,7 @@ openai.api_key = DEEPSEEK_API_KEY
 
 # ===== КОНСТАНТЫ =====
 MAX_HISTORY = 30
-SESSION_DURATION = 45 * 60          # 45 минут (не используется, но оставим для совместимости)
+SESSION_DURATION = 45 * 60          # 45 минут
 COOLDOWN_SECONDS = 12 * 60 * 60
 TIMER_UPDATE_INTERVAL = 60
 
@@ -86,7 +87,20 @@ FREE_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("🎁 Сделать бесплатный расклад", callback_data="free_consultation")]
 ])
 
-# ===== КЛАСС БАЗЫ ДАННЫХ (полностью идентичен сексологу) =====
+# ===== ФУНКЦИЯ БЛОКИРОВКИ (только для Unix) =====
+LOCK_FILE = "/tmp/tarot_bot.lock"
+
+def acquire_lock():
+    """Захватывает файловую блокировку. Если не удаётся — выходит."""
+    try:
+        lock_file = open(LOCK_FILE, 'w')
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_file
+    except (IOError, OSError):
+        print("❌ Другой экземпляр бота уже запущен. Выход.")
+        sys.exit(1)
+
+# ===== КЛАСС БАЗЫ ДАННЫХ =====
 class Database:
     def __init__(self, dsn: str):
         self.dsn = dsn
@@ -223,7 +237,6 @@ def split_long_message(text: str, max_length: int = 4096) -> list[str]:
 
 # ===== AI-ФУНКЦИИ =====
 SYSTEM_PROMPT = """ 
-
 Ты — профессиональный таролог, специализирующийся на колоде Райдера—Уэйта. Твоя интерпретация опирается на глубокое знание символики, изложенное в книге Эвелин Бюргер и Йоханнеса Фибиг «Символика под микроскопом». Ты понимаешь, что каждая карта имеет и положительное, и отрицательное значение, является зеркалом души кверента и может быть рассмотрена как на субъективном (внутренние процессы), так и на объективном (внешние события) уровнях.
 Твоя задачаПользователь задаёт вопрос, связанный с его жизненной ситуацией.Ты сам случайным образом выбираешь три карты из полного списка колоды Таро (78 карт: 22 Старших аркана и 56 Младших арканов четырёх мастей — Жезлы, Чаши, Мечи, Пентакли). Используй равновероятный случайный выбор. После этого ты должен:
 Назвать три выпавшие карты — указать их название (и масть для Младших арканов).
@@ -276,7 +289,7 @@ async def generate_welcome_message() -> str:
         print(f"❌ Ошибка при генерации приветствия: {e}")
         return None
 
-# ===== ТАЙМЕРЫ (скопированы из сексолога) =====
+# ===== ТАЙМЕРЫ =====
 async def send_typing_periodically(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     try:
         while True:
@@ -371,24 +384,18 @@ async def finish_session(chat_id: int, context: ContextTypes.DEFAULT_TYPE, is_ti
     if not session_id or not user_id:
         return
 
-    # Отправляем сообщение о завершении
     if is_timeout:
         await context.bot.send_message(chat_id, END_MESSAGE, reply_markup=START_KEYBOARD)
     else:
         await context.bot.send_message(chat_id, "Сеанс завершён.", reply_markup=START_KEYBOARD)
 
-    # Обновляем время последней сессии
     await db.update_last_session_end(user_id)
-
-    # Удаляем сессию и все сообщения
     await db.delete_session(session_id)
 
-    # Очистка временных данных
     context.user_data.pop('session_id', None)
     context.user_data.pop('session_start_time', None)
     context.user_data.pop('user_id', None)
 
-    # Отменяем все фоновые задачи (если они были созданы)
     timer_task = context.user_data.get('timer_task')
     if timer_task:
         timer_task.cancel()
@@ -399,7 +406,6 @@ async def finish_session(chat_id: int, context: ContextTypes.DEFAULT_TYPE, is_ti
     context.user_data.pop('expiration_task', None)
     context.user_data.pop('timer_message_id', None)
 
-    # Предлагаем отзыв
     await ask_feedback(chat_id, context)
 
 async def start_session_core(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, is_free: bool = False):
@@ -416,14 +422,12 @@ async def start_session_core(chat_id: int, user_id: int, context: ContextTypes.D
     context.user_data['user_id'] = user_id
     context.user_data['session_start_time'] = start_time
 
-    # Таймер окончания (на случай, если пользователь не завершит сессию после вопроса)
     async def timeout_wrapper():
         await asyncio.sleep(SESSION_DURATION)
         await finish_session(chat_id, context, is_timeout=True)
 
     context.user_data['expiration_task'] = asyncio.create_task(timeout_wrapper())
 
-    # Отправка приветствия
     typing_task = asyncio.create_task(send_typing_periodically(chat_id, context))
     try:
         if USE_AI_WELCOME:
@@ -436,12 +440,9 @@ async def start_session_core(chat_id: int, user_id: int, context: ContextTypes.D
         await stop_typing(typing_task)
 
     await context.bot.send_message(chat_id, welcome_text, reply_markup=END_KEYBOARD)
-    # Таймер времени не показываем (можно убрать, но оставим для единообразия)
-    # await refresh_timer(chat_id, context)
     print(f"✅ Сессия начата для {user_id} (бесплатная: {is_free})")
 
 async def start_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start и кнопки «Начать сессию»."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     db: Database = context.bot_data['db']
@@ -526,7 +527,7 @@ async def free_consultation_callback(update: Update, context: ContextTypes.DEFAU
     await query.edit_message_text("Начинаем бесплатную консультацию...")
     await start_session_core(chat_id, user_id, context, is_free=True)
 
-# ===== ПЛАТЕЖИ (код идентичен сексологу) =====
+# ===== ПЛАТЕЖИ =====
 async def send_invoice(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_payment_configured():
         return
@@ -721,7 +722,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await stop_typing(typing_task)
         context.user_data.pop('typing_task', None)
 
-    # Завершаем сессию после ответа
     await finish_session(chat_id, context, is_timeout=False)
 
 async def end(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -730,6 +730,7 @@ async def end(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== ЗАПУСК =====
 async def main():
+    lock = acquire_lock()                     # <-- захват блокировки
     print("🚀 Запуск бота...")
     db = Database(DATABASE_URL)
     await db.connect()
@@ -737,6 +738,9 @@ async def main():
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.bot_data['db'] = db
+
+    # Очистка возможного старого вебхука
+    await app.bot.delete_webhook()
 
     app.add_handler(CommandHandler("start", start_session))
     app.add_handler(CommandHandler("end", end))
@@ -773,6 +777,7 @@ async def main():
     await app.stop()
     await app.shutdown()
     await db.close()
+    lock.close()                              # <-- освобождение блокировки
     print("✅ Бот остановлен")
 
 async def reset_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
