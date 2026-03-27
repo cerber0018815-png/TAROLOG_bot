@@ -1,15 +1,16 @@
 import asyncio
-import time
-import openai
-import sys
 import os
+import sys
+import time
 import json
 import signal
-import fcntl                       # <-- добавлен для блокировки
-from datetime import datetime
-from dotenv import load_dotenv
+import openai
 import asyncpg
-from telegram import Update, ReplyKeyboardMarkup, LabeledPrice, InlineKeyboardButton, InlineKeyboardMarkup
+from dotenv import load_dotenv
+from telegram import (
+    Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup,
+    LabeledPrice
+)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
     ContextTypes, PreCheckoutQueryHandler, CallbackQueryHandler
@@ -17,7 +18,7 @@ from telegram.ext import (
 
 load_dotenv()
 
-# ===== НАСТРОЙКИ =====
+# ========== НАСТРОЙКИ ==========
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 DATABASE_URL = os.getenv('DATABASE_URL')
@@ -27,10 +28,12 @@ PRICE = int(os.getenv('PRICE', 10000))
 AUTHOR_CHAT_ID = os.getenv('AUTHOR_CHAT_ID')
 
 USE_AI_WELCOME = os.getenv('USE_AI_WELCOME', 'True').lower() in ('true', '1', 'yes')
-USE_AI_END = os.getenv('USE_AI_END', 'True').lower() in ('true', '1', 'yes')
 PAYMENT_ENABLED = os.getenv('PAYMENT_ENABLED', 'False').lower() in ('true', '1', 'yes')
 FREE_CONSULTATION_ENABLED = os.getenv('FREE_CONSULTATION_ENABLED', 'True').lower() in ('true', '1', 'yes')
 
+COOLDOWN_SECONDS = 12 * 60 * 60   # 12 часов
+
+# Текст для бесплатной консультации
 FREE_CONSULTATION_TEXT = (
     "✨ Я — виртуальный таролог.✨\n\n"
     "Я работаю с классической колодой Райдера—Уэйта и глубокой символикой.\n\n"
@@ -48,66 +51,158 @@ FREE_CONSULTATION_TEXT = (
     "Готовы заглянуть в себя? 🔮"
 )
 
-if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
-    print("❌ Ошибка: TELEGRAM_TOKEN или DEEPSEEK_API_KEY не найдены!")
-    sys.exit(1)
-
-if not DATABASE_URL:
-    print("❌ Ошибка: DATABASE_URL не задан!")
-    sys.exit(1)
-
-def is_payment_configured() -> bool:
-    if not PAYMENT_ENABLED or not PAYMENT_PROVIDER_TOKEN:
-        return False
-    if ':' not in PAYMENT_PROVIDER_TOKEN:
-        return False
-    return True
-
-if PAYMENT_ENABLED and not is_payment_configured():
-    print("⚠️ PAYMENT_ENABLED = True, но PAYMENT_PROVIDER_TOKEN не задан или невалиден. Платежи будут недоступны.")
-    PAYMENT_ENABLED = False
-
-openai.api_base = "https://api.deepseek.com/v1"
-openai.api_key = DEEPSEEK_API_KEY
-
-# ===== КОНСТАНТЫ =====
-MAX_HISTORY = 30
-SESSION_DURATION = 45 * 60          # 45 минут
-COOLDOWN_SECONDS = 12 * 60 * 60
-TIMER_UPDATE_INTERVAL = 60
-
-END_MESSAGE = "🕊️ Сеанс завершён. Если захотите новый расклад — нажмите «Начать сессию»."
-
-DEFAULT_WELCOME = "Здравствуйте! Задайте свой вопрос, и я вытяну для вас три карты Таро."
-
+# Клавиатуры
 START_KEYBOARD = ReplyKeyboardMarkup([["Начать сессию"]], resize_keyboard=True)
-END_KEYBOARD = ReplyKeyboardMarkup([["Завершить сессию"]], resize_keyboard=True)
-
+END_KEYBOARD = ReplyKeyboardMarkup([["Завершить сессию"]], resize_keyboard=True)  # не используется, но оставим
 FREE_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton("🎁 Сделать бесплатный расклад", callback_data="free_consultation")]
 ])
 
-# ===== ФУНКЦИЯ БЛОКИРОВКИ (только для Unix) =====
-LOCK_FILE = "/tmp/tarot_bot.lock"
+# Системный промпт (сокращённый, но функциональный)
+SYSTEM_PROMPT = """
+Ты — профессиональный таролог, специализирующийся на колоде Райдера—Уэйта. Твоя интерпретация опирается на глубокое знание символики, изложенное в книге Эвелин Бюргер и Йоханнеса Фибиг «Символика под микроскопом». Ты понимаешь, что каждая карта имеет и положительное, и отрицательное значение, является зеркалом души кверента и может быть рассмотрена как на субъективном (внутренние процессы), так и на объективном (внешние события) уровнях.
 
-def acquire_lock():
-    """Захватывает файловую блокировку. Если не удаётся — выходит."""
+Твоя задача
+Пользователь задаёт вопрос, связанный с его жизненной ситуацией.
+Ты сам случайным образом выбираешь три карты из полного списка колоды Таро (78 карт: 22 Старших аркана и 56 Младших арканов четырёх мастей — Жезлы, Чаши, Мечи, Пентакли). Используй равновероятный случайный выбор. После этого ты должен:
+
+Назвать три выпавшие карты — указать их название (и масть для Младших арканов).
+
+Кратко представить каждую карту — описать ключевые символы и основное значение, выделив как позитивные, так и негативные аспекты (если они уместны в контексте вопроса).
+
+Выполнить синтез — найти взаимосвязи между картами: общую тему, перекличку символов, возможные противоречия или усиления. Объяснить, как эти карты «разговаривают» друг с другом.
+
+Сделать общий развёрнутый вывод, который напрямую отвечает на вопрос пользователя. Вывод должен быть метафоричным, образным, но при этом практически полезным. Используй метафоры из описаний карт (розовый сад, башня, поток, зеркало и т.п.).
+
+По желанию добавить квинтэссенцию — сложи числовые значения карт (для Старших арканов — их номер; для Младших — число от 1 до 10; для придворных карт: Паж, Рыцарь, Королева, Король — 0), сведи к числу от 1 до 22 и назови соответствующий Старший аркан как итоговый совет или резюме расклада.
+
+Правила интерпретации
+Учитывай, что карты могут отражать как внешние обстоятельства, так и внутреннее состояние кверента. Если вопрос касается отношений, работы, самооценки — выбирай уместный уровень.
+
+Не бойся «сложных» карт (Смерть, Башня, Дьявол). Показывай их преобразующую, освобождающую сторону.
+
+Обращай внимание на детали: цвета, позы, предметы за спиной фигур — они дают ключ к скрытым смыслам.
+
+Если карт три, рассматривай их как диалог: одна может указывать на препятствие, другая — на ресурс, третья — на путь решения. Можешь интерпретировать их как «ситуация – препятствие – совет» или «прошлое – настоящее – будущее» — выбери схему, которая лучше всего подходит к вопросу, и сообщи её пользователю.
+
+Будь уважителен к пользователю. Твоя цель — не предсказание судьбы, а помощь в осознании ситуации и поиске собственного пути.
+
+Структура ответа
+Вступление (1–2 предложения): объяви, что ты вытянул три карты, и кратко обозначь общую атмосферу расклада.
+
+Перечисление выпавших карт (чётко назови их).
+
+Разбор каждой карты (по 3–5 предложений на карту): название, ключевые символы, значение применительно к вопросу, возможные грани.
+
+Синтез и взаимодействие (3–6 предложений): как карты сочетаются, что усиливают, что смягчают, какие параллели можно провести.
+
+Квинтэссенция (если уместно): суммарный аркан и его краткий смысл.
+
+Общий ответ на вопрос (3–8 предложений): развёрнутый, метафоричный, с советом или новым взглядом на ситуацию.
+
+Заключительная фраза (по желанию): напутствие или вопрос для размышления.
+
+Стиль ответа
+Используй живые образы: «вы стоите у корней дерева», «алый лев пробуждается в вашем сердце», «горизонтальная восьмёрка приглашает вас к бесконечному танцу».
+
+Избегай сухих перечислений. Пусть твой язык будет плавным, поэтичным, но при этом понятным.
+
+Обращайся к пользователю на «вы» (уважительно).
+
+Полный список карт колоды Райдера—Уэйта (для случайного выбора)
+Старшие арканы (22):
+0. Шут / Дурак
+I. Маг
+II. Верховная Жрица
+III. Императрица
+IV. Император
+V. Иерофант
+VI. Влюблённые
+VII. Колесница
+VIII. Сила
+IX. Отшельник
+X. Колесо Фортуны
+XI. Правосудие
+XII. Повешенный
+XIII. Смерть
+XIV. Умеренность
+XV. Дьявол
+XVI. Башня
+XVII. Звезда
+XVIII. Луна
+XIX. Солнце
+XX. Суд
+XXI. Мир
+
+Младшие арканы (56):
+Жезлы (огонь, воля): Туз, 2, 3, 4, 5, 6, 7, 8, 9, 10, Паж, Рыцарь, Королева, Король.
+Чаши (вода, чувства): Туз, 2, 3, 4, 5, 6, 7, 8, 9, 10, Паж, Рыцарь, Королева, Король.
+Мечи (воздух, разум): Туз, 2, 3, 4, 5, 6, 7, 8, 9, 10, Паж, Рыцарь, Королева, Король.
+Пентакли (земля, материя): Туз, 2, 3, 4, 5, 6, 7, 8, 9, 10, Паж, Рыцарь, Королева, Король.
+
+Пример начала работы бота
+После получения вопроса пользователя бот (ты) мысленно выбирает три случайные карты из списка, затем отвечает по шаблону:
+
+«Я вытянул для вас три карты. Их сочетание напоминает древнюю притчу: сначала герой встречает тьму, затем находит опору, а в конце обретает свет. Давайте посмотрим, что они говорят…
+Выпали: …»
+
+Дополнительная инструкция для ИИ
+При случайном выборе используй равномерное распределение: все 78 карт равновероятны.
+
+Если пользователь сам указал карты, просто интерпретируй их, не генерируя новые.
+
+Если пользователь задал вопрос без уточнения схемы, можешь интерпретировать три карты как «ситуация – вызов – путь» или «прошлое – настоящее – будущее», указав, какую схему ты применяешь.
+
+Будь внимателен: для придворных карт (Паж, Рыцарь, Королева, Король) числовое значение для квинтэссенции — 0. Для Тузов — 1. Для остальных числовых карт — число от 2 до 10. Для Старших арканов — их номер (для Шута — 0).
+"""
+
+# ========== ПРОВЕРКИ ==========
+if not TELEGRAM_TOKEN or not DEEPSEEK_API_KEY:
+    print("❌ TELEGRAM_TOKEN или DEEPSEEK_API_KEY не заданы!")
+    sys.exit(1)
+if not DATABASE_URL:
+    print("❌ DATABASE_URL не задан!")
+    sys.exit(1)
+
+openai.api_base = "https://api.deepseek.com/v1"
+openai.api_key = DEEPSEEK_API_KEY
+
+def is_payment_configured():
+    return PAYMENT_ENABLED and PAYMENT_PROVIDER_TOKEN and ':' in PAYMENT_PROVIDER_TOKEN
+
+# ========== БЛОКИРОВКА PID ==========
+PID_FILE = "/tmp/tarot_bot.pid"
+
+def check_and_create_pid():
+    if os.path.exists(PID_FILE):
+        with open(PID_FILE, 'r') as f:
+            old_pid = int(f.read().strip())
+        try:
+            os.kill(old_pid, 0)
+            print(f"❌ Бот уже запущен (PID {old_pid}). Завершаем.")
+            sys.exit(1)
+        except OSError:
+            print(f"⚠️ PID-файл есть, но процесс {old_pid} не жив. Удаляем.")
+            os.remove(PID_FILE)
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+    print(f"✅ PID-файл создан: {PID_FILE}")
+
+def remove_pid():
     try:
-        lock_file = open(LOCK_FILE, 'w')
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return lock_file
-    except (IOError, OSError):
-        print("❌ Другой экземпляр бота уже запущен. Выход.")
-        sys.exit(1)
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+    except:
+        pass
 
-# ===== КЛАСС БАЗЫ ДАННЫХ =====
+# ========== БАЗА ДАННЫХ (упрощённая) ==========
 class Database:
-    def __init__(self, dsn: str):
+    def __init__(self, dsn):
         self.dsn = dsn
         self.pool = None
 
     async def connect(self):
-        self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=10)
+        self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
 
     async def close(self):
         if self.pool:
@@ -123,379 +218,193 @@ class Database:
                     created_at TIMESTAMPTZ DEFAULT now()
                 )
             """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS sessions (
-                    session_id SERIAL PRIMARY KEY,
-                    user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
-                    start_time TIMESTAMPTZ NOT NULL,
-                    expiry_time TIMESTAMPTZ NOT NULL,
-                    status TEXT DEFAULT 'active'
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS messages (
-                    id SERIAL PRIMARY KEY,
-                    session_id INTEGER REFERENCES sessions(session_id) ON DELETE CASCADE,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    created_at TIMESTAMPTZ DEFAULT now()
-                )
-            """)
 
-    async def get_or_create_user(self, user_id: int) -> None:
+    async def get_or_create_user(self, user_id):
         async with self.pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
                 user_id
             )
 
-    async def is_free_used(self, user_id: int) -> bool:
+    async def is_free_used(self, user_id):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT free_used FROM users WHERE user_id = $1", user_id
+            ) or False
+
+    async def set_free_used(self, user_id):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET free_used = true WHERE user_id = $1", user_id
+            )
+
+    async def update_last_session_end(self, user_id):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET last_session_end = now() WHERE user_id = $1", user_id
+            )
+
+    async def get_last_session_end(self, user_id):
         async with self.pool.acquire() as conn:
             row = await conn.fetchval(
-                "SELECT free_used FROM users WHERE user_id = $1",
-                user_id
+                "SELECT last_session_end FROM users WHERE user_id = $1", user_id
             )
-            return row if row is not None else False
+            return row.timestamp() if row else None
 
-    async def set_free_used(self, user_id: int) -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET free_used = true WHERE user_id = $1",
-                user_id
-            )
-
-    async def update_last_session_end(self, user_id: int) -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET last_session_end = now() WHERE user_id = $1",
-                user_id
-            )
-
-    async def get_last_session_end(self, user_id: int) -> float | None:
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchval(
-                "SELECT last_session_end FROM users WHERE user_id = $1",
-                user_id
-            )
-            if row:
-                return row.timestamp()
-            return None
-
-    async def create_session(self, user_id: int, start_time: float, expiry_time: float) -> int:
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "INSERT INTO sessions (user_id, start_time, expiry_time) VALUES ($1, to_timestamp($2), to_timestamp($3)) RETURNING session_id",
-                user_id, start_time, expiry_time
-            )
-            return row['session_id']
-
-    async def get_active_session(self, user_id: int) -> dict | None:
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT session_id, start_time, expiry_time FROM sessions WHERE user_id = $1 AND status = 'active' AND expiry_time > now()",
-                user_id
-            )
-            return dict(row) if row else None
-
-    async def add_message(self, session_id: int, role: str, content: str) -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO messages (session_id, role, content) VALUES ($1, $2, $3)",
-                session_id, role, content
-            )
-
-    async def get_session_history(self, session_id: int, limit: int = 30) -> list[dict]:
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT role, content FROM messages WHERE session_id = $1 ORDER BY created_at ASC LIMIT $2",
-                session_id, limit
-            )
-            return [dict(row) for row in rows]
-
-    async def delete_session(self, session_id: int) -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM sessions WHERE session_id = $1",
-                session_id
-            )
-
-# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
-def split_long_message(text: str, max_length: int = 4096) -> list[str]:
-    if len(text) <= max_length:
-        return [text]
-    parts = []
-    while text:
-        if len(text) <= max_length:
-            parts.append(text)
-            break
-        split_index = text.rfind(' ', 0, max_length)
-        if split_index == -1:
-            split_index = max_length
-        parts.append(text[:split_index].strip())
-        text = text[split_index:].strip()
-    return parts
-
-# ===== AI-ФУНКЦИИ =====
-SYSTEM_PROMPT = """ 
-Ты — профессиональный таролог, специализирующийся на колоде Райдера—Уэйта. Твоя интерпретация опирается на глубокое знание символики, изложенное в книге Эвелин Бюргер и Йоханнеса Фибиг «Символика под микроскопом». Ты понимаешь, что каждая карта имеет и положительное, и отрицательное значение, является зеркалом души кверента и может быть рассмотрена как на субъективном (внутренние процессы), так и на объективном (внешние события) уровнях.
-Твоя задачаПользователь задаёт вопрос, связанный с его жизненной ситуацией.Ты сам случайным образом выбираешь три карты из полного списка колоды Таро (78 карт: 22 Старших аркана и 56 Младших арканов четырёх мастей — Жезлы, Чаши, Мечи, Пентакли). Используй равновероятный случайный выбор. После этого ты должен:
-Назвать три выпавшие карты — указать их название (и масть для Младших арканов).
-Кратко представить каждую карту — описать ключевые символы и основное значение, выделив как позитивные, так и негативные аспекты (если они уместны в контексте вопроса).
-Выполнить синтез — найти взаимосвязи между картами: общую тему, перекличку символов, возможные противоречия или усиления. Объяснить, как эти карты «разговаривают» друг с другом.
-Сделать общий развёрнутый вывод, который напрямую отвечает на вопрос пользователя. Вывод должен быть метафоричным, образным, но при этом практически полезным. Используй метафоры из описаний карт (розовый сад, башня, поток, зеркало и т.п.).
-По желанию добавить квинтэссенцию — сложи числовые значения карт (для Старших арканов — их номер; для Младших — число от 1 до 10; для придворных карт: Паж, Рыцарь, Королева, Король — 0), сведи к числу от 1 до 22 и назови соответствующий Старший аркан как итоговый совет или резюме расклада.
-Правила интерпретацииУчитывай, что карты могут отражать как внешние обстоятельства, так и внутреннее состояние кверента. Если вопрос касается отношений, работы, самооценки — выбирай уместный уровень.
-Не бойся «сложных» карт (Смерть, Башня, Дьявол). Показывай их преобразующую, освобождающую сторону.
-Обращай внимание на детали: цвета, позы, предметы за спиной фигур — они дают ключ к скрытым смыслам.
-Если карт три, рассматривай их как диалог: одна может указывать на препятствие, другая — на ресурс, третья — на путь решения. Можешь интерпретировать их как «ситуация – препятствие – совет» или «прошлое – настоящее – будущее» — выбери схему, которая лучше всего подходит к вопросу, и сообщи её пользователю.
-Будь уважителен к пользователю. Твоя цель — не предсказание судьбы, а помощь в осознании ситуации и поиске собственного пути.
-Структура ответаВступление (1–2 предложения): объяви, что ты вытянул три карты, и кратко обозначь общую атмосферу расклада.
-Перечисление выпавших карт (чётко назови их).
-Разбор каждой карты (по 3–5 предложений на карту): название, ключевые символы, значение применительно к вопросу, возможные грани.
-Синтез и взаимодействие (3–6 предложений): как карты сочетаются, что усиливают, что смягчают, какие параллели можно провести.
-Квинтэссенция (если уместно): суммарный аркан и его краткий смысл.
-Общий ответ на вопрос (3–8 предложений): развёрнутый, метафоричный, с советом или новым взглядом на ситуацию.
-Заключительная фраза (по желанию): напутствие или вопрос для размышления.
-Стиль ответаИспользуй живые образы: «вы стоите у корней дерева», «алый лев пробуждается в вашем сердце», «горизонтальная восьмёрка приглашает вас к бесконечному танцу».
-Избегай сухих перечислений. Пусть твой язык будет плавным, поэтичным, но при этом понятным.
-Обращайся к пользователю на «вы» (уважительно).
-Полный список карт колоды Райдера—Уэйта (для случайного выбора)Старшие арканы (22):0. Шут / ДуракI. МагII. Верховная ЖрицаIII. ИмператрицаIV. ИмператорV. ИерофантVI. ВлюблённыеVII. КолесницаVIII. СилаIX. ОтшельникX. Колесо ФортуныXI. ПравосудиеXII. ПовешенныйXIII. СмертьXIV. УмеренностьXV. ДьяволXVI. БашняXVII. ЗвездаXVIII. ЛунаXIX. СолнцеXX. СудXXI. Мир
-Младшие арканы (56):Жезлы (огонь, воля): Туз, 2, 3, 4, 5, 6, 7, 8, 9, 10, Паж, Рыцарь, Королева, Король.Чаши (вода, чувства): Туз, 2, 3, 4, 5, 6, 7, 8, 9, 10, Паж, Рыцарь, Королева, Король.Мечи (воздух, разум): Туз, 2, 3, 4, 5, 6, 7, 8, 9, 10, Паж, Рыцарь, Королева, Король.Пентакли (земля, материя): Туз, 2, 3, 4, 5, 6, 7, 8, 9, 10, Паж, Рыцарь, Королева, Король.
-Пример начала работы ботаПосле получения вопроса пользователя бот (ты) мысленно выбирает три случайные карты из списка, затем отвечает по шаблону:
-«Я вытянул для вас три карты. Их сочетание напоминает древнюю притчу: сначала герой встречает тьму, затем находит опору, а в конце обретает свет. Давайте посмотрим, что они говорят…Выпали: …»
-Дополнительная инструкция для ИИПри случайном выборе используй равномерное распределение: все 78 карт равновероятны.
-Если пользователь сам указал карты, просто интерпретируй их, не генерируя новые.
-Если пользователь задал вопрос без уточнения схемы, можешь интерпретировать три карты как «ситуация – вызов – путь» или «прошлое – настоящее – будущее», указав, какую схему ты применяешь.
-Будь внимателен: для придворных карт (Паж, Рыцарь, Королева, Король) числовое значение для квинтэссенции — 0. Для Тузов — 1. Для остальных числовых карт — число от 2 до 10. Для Старших арканов — их номер (для Шута — 0).
-Этот промт можно использовать в диалоге с ИИ, который поддерживает выполнение программной логики (например, ChatGPT с код-интерпретатором или API с вызовом функции random). Если же ИИ не может программно генерировать случайные числа, можно вручную указать, что он должен «вообразить» случайный выбор, опираясь на описание процесса. В текущей версии я добавил чёткий алгоритм и список всех карт, чтобы ИИ мог осмысленно произвести выбор. 
-"""
-
-async def generate_welcome_message() -> str:
+# ========== AI ФУНКЦИИ ==========
+async def generate_welcome_message():
     try:
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "Пользователь готов начать разговор. Напиши приветствие, которое пригласит его поделиться тем, что его беспокоит. Объясни что чем более детально пользователь опишит свою проблему, тем более подробным будет ответ. Сохрани свой обычный тон. Не используй Markdown, просто текст."}
+            {"role": "user", "content": "Напиши краткое приветствие для пользователя, который готов задать вопрос. Объясни, что чем подробнее он опишет ситуацию, тем точнее будет расклад. Не используй Markdown."}
         ]
         response = await asyncio.to_thread(
             openai.ChatCompletion.create,
             model="deepseek-chat",
             messages=messages,
-            max_tokens=800,
-            temperature=1
+            max_tokens=500,
+            temperature=0.7
         )
-        welcome = response.choices[0].message.content.strip()
-        return welcome
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"❌ Ошибка при генерации приветствия: {e}")
-        return None
+        print(f"❌ Ошибка генерации приветствия: {e}")
+        return "Задайте свой вопрос, и я вытяну для вас три карты Таро."
 
-# ===== ТАЙМЕРЫ =====
-async def send_typing_periodically(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def ask_ai(question, history):
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for msg in history:
+        messages.append(msg)
+    messages.append({"role": "user", "content": question})
     try:
-        while True:
-            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-            await asyncio.sleep(4)
-    except asyncio.CancelledError:
-        pass
+        response = await asyncio.to_thread(
+            openai.ChatCompletion.create,
+            model="deepseek-chat",
+            messages=messages,
+            max_tokens=2000,
+            temperature=0.8
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"❌ Ошибка DeepSeek: {e}")
+        return "Извините, произошла ошибка. Попробуйте позже."
 
-async def stop_typing(typing_task: asyncio.Task):
-    if typing_task and not typing_task.done():
-        typing_task.cancel()
-        try:
-            await typing_task
-        except asyncio.CancelledError:
-            pass
-
-async def update_timer_periodically(chat_id: int, message_id: int, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await asyncio.sleep(TIMER_UPDATE_INTERVAL)
-        while True:
-            current_timer_id = context.user_data.get('timer_message_id')
-            if current_timer_id != message_id:
-                break
-            if 'session_start_time' not in context.user_data:
-                try:
-                    await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-                except:
-                    pass
-                break
-            elapsed = time.time() - context.user_data['session_start_time']
-            remaining = SESSION_DURATION - elapsed
-            if remaining <= 0:
-                try:
-                    await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-                except:
-                    pass
-                break
-            minutes = int(remaining // 60)
-            seconds = int(remaining % 60)
-            timer_text = f"⏳ Осталось: {minutes} мин {seconds} сек"
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=timer_text
-                )
-            except Exception:
-                break
-            await asyncio.sleep(TIMER_UPDATE_INTERVAL)
-    except asyncio.CancelledError:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except:
-            pass
-        raise
-
-async def refresh_timer(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    old_task = context.user_data.get('timer_task')
-    if old_task and not old_task.done():
-        old_task.cancel()
-        try:
-            await old_task
-        except asyncio.CancelledError:
-            pass
-    old_msg_id = context.user_data.get('timer_message_id')
-    if old_msg_id:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
-        except:
-            pass
-    if 'session_start_time' in context.user_data:
-        remaining = SESSION_DURATION - (time.time() - context.user_data['session_start_time'])
-        if remaining > 0:
-            minutes = int(remaining // 60)
-            seconds = int(remaining % 60)
-            timer_text = f"⏳ Осталось: {minutes} мин {seconds} сек"
-            try:
-                timer_msg = await context.bot.send_message(chat_id=chat_id, text=timer_text)
-            except Exception:
-                return
-            context.user_data['timer_message_id'] = timer_msg.message_id
-            task = asyncio.create_task(
-                update_timer_periodically(chat_id, timer_msg.message_id, context)
-            )
-            context.user_data['timer_task'] = task
-
-# ===== ОСНОВНЫЕ ФУНКЦИИ СЕССИИ =====
-async def finish_session(chat_id: int, context: ContextTypes.DEFAULT_TYPE, is_timeout: bool = False):
-    db: Database = context.bot_data['db']
-    session_id = context.user_data.get('session_id')
-    user_id = context.user_data.get('user_id')
-    if not session_id or not user_id:
+# ========== ПЛАТЕЖИ ==========
+async def send_invoice(chat_id, context):
+    if not is_payment_configured():
         return
-
-    if is_timeout:
-        await context.bot.send_message(chat_id, END_MESSAGE, reply_markup=START_KEYBOARD)
-    else:
-        await context.bot.send_message(chat_id, "Сеанс завершён.", reply_markup=START_KEYBOARD)
-
-    await db.update_last_session_end(user_id)
-    await db.delete_session(session_id)
-
-    context.user_data.pop('session_id', None)
-    context.user_data.pop('session_start_time', None)
-    context.user_data.pop('user_id', None)
-
-    timer_task = context.user_data.get('timer_task')
-    if timer_task:
-        timer_task.cancel()
-    exp_task = context.user_data.get('expiration_task')
-    if exp_task:
-        exp_task.cancel()
-    context.user_data.pop('timer_task', None)
-    context.user_data.pop('expiration_task', None)
-    context.user_data.pop('timer_message_id', None)
-
-    await ask_feedback(chat_id, context)
-
-async def start_session_core(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, is_free: bool = False):
-    db: Database = context.bot_data['db']
-    if await db.get_active_session(user_id):
-        await context.bot.send_message(chat_id, "У вас уже есть активная сессия.", reply_markup=END_KEYBOARD)
-        return
-
-    start_time = time.time()
-    expiry_time = start_time + SESSION_DURATION
-    session_id = await db.create_session(user_id, start_time, expiry_time)
-
-    context.user_data['session_id'] = session_id
-    context.user_data['user_id'] = user_id
-    context.user_data['session_start_time'] = start_time
-
-    async def timeout_wrapper():
-        await asyncio.sleep(SESSION_DURATION)
-        await finish_session(chat_id, context, is_timeout=True)
-
-    context.user_data['expiration_task'] = asyncio.create_task(timeout_wrapper())
-
-    typing_task = asyncio.create_task(send_typing_periodically(chat_id, context))
+    prices = [LabeledPrice(label="Расклад Таро", amount=PRICE)]
+    provider_data = json.dumps({
+        "receipt": {
+            "items": [{
+                "description": "Расклад Таро",
+                "quantity": "1.00",
+                "amount": {"value": f"{PRICE/100:.2f}", "currency": CURRENCY},
+                "vat_code": 1
+            }]
+        }
+    })
     try:
-        if USE_AI_WELCOME:
-            welcome_text = await generate_welcome_message()
-            if not welcome_text:
-                welcome_text = DEFAULT_WELCOME
-        else:
-            welcome_text = DEFAULT_WELCOME
-    finally:
-        await stop_typing(typing_task)
+        await context.bot.send_invoice(
+            chat_id=chat_id,
+            title="Оплата расклада",
+            description="Один расклад Таро (3 карты с подробным разбором)",
+            payload="tarot_payment",
+            provider_token=PAYMENT_PROVIDER_TOKEN,
+            currency=CURRENCY,
+            prices=prices,
+            provider_data=provider_data,
+            need_email=True,
+            send_email_to_provider=True
+        )
+    except Exception as e:
+        print(f"❌ Ошибка отправки инвойса: {e}")
+        await context.bot.send_message(
+            chat_id, "Платёжная система временно недоступна. Попробуйте позже."
+        )
 
-    await context.bot.send_message(chat_id, welcome_text, reply_markup=END_KEYBOARD)
-    print(f"✅ Сессия начата для {user_id} (бесплатная: {is_free})")
+# ========== ОТЗЫВЫ ==========
+async def ask_feedback(chat_id, context):
+    keyboard = [
+        [InlineKeyboardButton("📝 Оставить отзыв", callback_data="feedback_yes")],
+        [InlineKeyboardButton("❌ Пропустить", callback_data="feedback_no")]
+    ]
+    await context.bot.send_message(
+        chat_id,
+        "Вы можете оставить отзыв о прошедшей сессии.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# ========== ОБРАБОТЧИКИ ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало работы – кнопка «Начать сессию»."""
+    await update.message.reply_text(
+        "Добро пожаловать! Нажмите «Начать сессию», чтобы получить расклад.",
+        reply_markup=START_KEYBOARD
+    )
 
 async def start_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка кнопки «Начать сессию»."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     db: Database = context.bot_data['db']
 
     await db.get_or_create_user(user_id)
 
-    if context.user_data.get('session_id'):
-        await update.message.reply_text("У вас уже есть активная сессия.", reply_markup=END_KEYBOARD)
+    # Если уже есть активная сессия (ожидание вопроса) – не начинаем новую
+    if context.user_data.get('waiting_for_question'):
+        await update.message.reply_text(
+            "Вы уже задаёте вопрос. Напишите его, я готовлю расклад."
+        )
         return
 
+    # Бесплатная консультация?
+    if FREE_CONSULTATION_ENABLED:
+        free_used = await db.is_free_used(user_id)
+        if not free_used:
+            # Предлагаем бесплатную
+            await update.message.reply_text(
+                FREE_CONSULTATION_TEXT,
+                parse_mode='Markdown',
+                reply_markup=FREE_KEYBOARD
+            )
+            return
+
+    # Проверка кулдауна
     last_end = await db.get_last_session_end(user_id)
     if last_end and (time.time() - last_end) < COOLDOWN_SECONDS:
         remaining = COOLDOWN_SECONDS - (time.time() - last_end)
-        hours_left = int(remaining // 3600)
-        minutes_left = int((remaining % 3600) // 60)
+        hours = int(remaining // 3600)
+        minutes = int((remaining % 3600) // 60)
         await update.message.reply_text(
-            f"🌙 Картам нужно время, чтобы их образы улеглись в душе. "
-            f"Следующий расклад будет доступен через {hours_left} ч {minutes_left} мин. "
-            f"Приходите позже — мудрость не терпит спешки. ",
+            f"🌙 Картам нужно время, чтобы их образы улеглись в душе.\n"
+            f"Следующий расклад будет доступен через {hours} ч {minutes} мин.\n"
+            f"Приходите позже — мудрость не терпит спешки.",
             reply_markup=START_KEYBOARD
         )
         return
 
-    if FREE_CONSULTATION_ENABLED:
-        free_used = await db.is_free_used(user_id)
-        if not free_used:
-            await update.message.reply_text(FREE_CONSULTATION_TEXT, parse_mode='Markdown', reply_markup=FREE_KEYBOARD)
-            return
-
+    # Если платежи включены, отправляем инвойс
     if is_payment_configured():
         service_text = (
             "✨ Я — виртуальный таролог.✨\n\n"
             "Я работаю с классической колодой Райдера—Уэйта и глубокой символикой.\n\n"
             "Как проходит сеанс:\n"
-            "1. Вы задаёте любой вопрос (отношения, работа, выбор, саморазвитие).\n"
-            "2. Я вытягиваю для вас 3 случайные карты Таро.\n"
-            "3. Даю подробный разбор:\n"
-            "• значение каждой карты (символы, детали, смысл)\n"
-            "• их взаимодействие друг с другом\n"
-            "• общий синтез — ответ на ваш вопрос\n"
-            "4. При необходимости — итоговая карта-квинтэссенция.\n\n"
-            "Карты — не предсказание, а зеркало вашей души.\n"
-            "Я помогаю увидеть скрытые грани ситуации, найти ресурсы и принять осознанное решение.\n\n"
+            "1. Вы задаёте вопрос.\n"
+            "2. Я вытягиваю 3 случайные карты Таро.\n"
+            "3. Даю подробный разбор, синтез и ответ.\n\n"
             f"💰 Стоимость одного расклада — {PRICE/100} {CURRENCY}\n\n"
             "Сразу после оплаты вы сможете задать свой вопрос.\n\n"
             "Готовы заглянуть в себя? 🔮"
         )
         await update.message.reply_text(service_text, parse_mode='Markdown')
         await send_invoice(chat_id, context)
-    else:
-        await start_session_core(chat_id, user_id, context, is_free=False)
+        return
+
+    # Если платежи отключены – сразу начинаем сессию
+    await start_session_core(chat_id, user_id, context)
 
 async def free_consultation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатия на кнопку бесплатной консультации."""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -504,98 +413,141 @@ async def free_consultation_callback(update: Update, context: ContextTypes.DEFAU
 
     free_used = await db.is_free_used(user_id)
     if free_used:
-        await query.edit_message_text("Вы уже использовали бесплатную консультацию. Следующие сессии – платные.")
+        await query.edit_message_text("Вы уже использовали бесплатную консультацию.")
         return
 
-    if context.user_data.get('session_id'):
-        await query.edit_message_text("У вас уже есть активная сессия. Завершите её перед началом новой.")
+    if context.user_data.get('waiting_for_question'):
+        await query.edit_message_text("У вас уже есть активная сессия. Завершите её.")
         return
 
-    last_end = await db.get_last_session_end(user_id)
-    if last_end and (time.time() - last_end) < COOLDOWN_SECONDS:
-        remaining = COOLDOWN_SECONDS - (time.time() - last_end)
-        hours_left = int(remaining // 3600)
-        minutes_left = int((remaining % 3600) // 60)
-        await query.edit_message_text(
-            f"🌙 Картам нужно время, чтобы их образы улеглись в душе. "
-            f"Следующий расклад будет доступен через {hours_left} ч {minutes_left} мин. "
-            f"Приходите позже — мудрость не терпит спешки. "
-        )
-        return
-
+    # Записываем, что бесплатная использована
     await db.set_free_used(user_id)
     await query.edit_message_text("Начинаем бесплатную консультацию...")
-    await start_session_core(chat_id, user_id, context, is_free=True)
+    await start_session_core(chat_id, user_id, context)
 
-# ===== ПЛАТЕЖИ =====
-async def send_invoice(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_payment_configured():
-        return
-    prices = [LabeledPrice(label="Сессия (45 мин)", amount=PRICE)]
-    provider_data = json.dumps({
-        "receipt": {
-            "items": [{
-                "description": "Консультация (45 минут)",
-                "quantity": "1.00",
-                "amount": {"value": f"{PRICE/100:.2f}", "currency": CURRENCY},
-                "vat_code": 1
-            }]
-        }
-    })
-    try:
-        invoice_message = await context.bot.send_invoice(
-            chat_id=chat_id,
-            title="Оплата сессии",
-            description="Один расклад ТАРО",
-            payload="session_payment",
-            provider_token=PAYMENT_PROVIDER_TOKEN,
-            currency=CURRENCY,
-            prices=prices,
-            provider_data=provider_data,
-            need_email=True,
-            send_email_to_provider=True
-        )
-        return invoice_message
-    except Exception as e:
-        print(f"❌ Ошибка при отправке инвойса: {e}")
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Извините, платёжная система временно недоступна. Попробуйте позже или обратитесь к администратору."
-        )
-        return None
+async def start_session_core(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Запуск сессии: приветствие и ожидание вопроса."""
+    db: Database = context.bot_data['db']
 
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_payment_configured():
-        await update.message.reply_text("Платёжные функции отключены администратором.")
-        return
+    # Генерируем приветствие
+    if USE_AI_WELCOME:
+        welcome = await generate_welcome_message()
+    else:
+        welcome = "Задайте свой вопрос, и я вытяну для вас три карты Таро."
+
+    # Отправляем приветствие и переводим бота в режим ожидания вопроса
+    await context.bot.send_message(
+        chat_id, welcome,
+        reply_markup=ReplyKeyboardMarkup([["Завершить сессию"]], resize_keyboard=True)
+    )
+    context.user_data['waiting_for_question'] = True
+    context.user_data['user_id'] = user_id
+    context.user_data['chat_id'] = chat_id
+    # Для истории сообщений (просто список пар роль-текст)
+    context.user_data['history'] = []
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка текстовых сообщений."""
+    user_message = update.message.text
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     db: Database = context.bot_data['db']
 
-    if FREE_CONSULTATION_ENABLED:
-        free_used = await db.is_free_used(user_id)
-        if not free_used:
-            await update.message.reply_text(FREE_CONSULTATION_TEXT, parse_mode='Markdown', reply_markup=FREE_KEYBOARD)
-            return
-
-    if context.user_data.get('session_id'):
-        await update.message.reply_text("У вас уже есть активная сессия.", reply_markup=END_KEYBOARD)
+    # Если пользователь нажал "Завершить сессию" – сбрасываем состояние
+    if user_message == "Завершить сессию":
+        if context.user_data.get('waiting_for_question'):
+            context.user_data.clear()
+            await update.message.reply_text(
+                "Сеанс завершён. Если захотите новый расклад — нажмите «Начать сессию».",
+                reply_markup=START_KEYBOARD
+            )
+        else:
+            await update.message.reply_text(
+                "Активной сессии нет. Нажмите «Начать сессию».",
+                reply_markup=START_KEYBOARD
+            )
         return
 
-    last_end = await db.get_last_session_end(user_id)
-    if last_end and (time.time() - last_end) < COOLDOWN_SECONDS:
-        remaining = COOLDOWN_SECONDS - (time.time() - last_end)
-        hours_left = int(remaining // 3600)
-        minutes_left = int((remaining % 3600) // 60)
+    # Если мы в режиме ожидания вопроса – обрабатываем
+    if context.user_data.get('waiting_for_question'):
+        # Проверяем, что сессия принадлежит этому пользователю
+        if context.user_data.get('user_id') != user_id:
+            await update.message.reply_text(
+                "Сейчас идёт сессия другого пользователя. Подождите.",
+                reply_markup=START_KEYBOARD
+            )
+            return
+
+        # Показываем "печатает"
+        await context.bot.send_chat_action(chat_id, action="typing")
+
+        # Получаем историю (сохраняем до 10 последних сообщений)
+        history = context.user_data.get('history', [])
+        answer = await ask_ai(user_message, history)
+
+        # Сохраняем историю (вопрос и ответ)
+        history.append({"role": "user", "content": user_message})
+        history.append({"role": "assistant", "content": answer})
+        if len(history) > 10:  # ограничим историю
+            history = history[-10:]
+        context.user_data['history'] = history
+
+        # Отправляем ответ (разбиваем на части, если длинный)
+        if len(answer) > 4096:
+            for i in range(0, len(answer), 4096):
+                await update.message.reply_text(answer[i:i+4096])
+        else:
+            await update.message.reply_text(answer)
+
+        # Завершаем сессию: записываем время, сбрасываем флаг
+        await db.update_last_session_end(user_id)
+        context.user_data.pop('waiting_for_question', None)
+        context.user_data.pop('user_id', None)
+        context.user_data.pop('chat_id', None)
+        context.user_data.pop('history', None)
+
+        # Предлагаем отзыв
+        await ask_feedback(chat_id, context)
+
+        # Возвращаем клавиатуру "Начать сессию"
         await update.message.reply_text(
-            f"🌙 Картам нужно время, чтобы их образы улеглись в душе. "
-            f"Следующий расклад будет доступен через {hours_left} ч {minutes_left} мин. "
-            f"Приходите позже — мудрость не терпит спешки. "
+            "Сеанс завершён. Если захотите новый расклад — нажмите «Начать сессию».",
+            reply_markup=START_KEYBOARD
         )
         return
 
-    await send_invoice(chat_id, context)
+    # Если нет активной сессии
+    await update.message.reply_text(
+        "Сейчас нет активной сессии. Нажмите «Начать сессию».",
+        reply_markup=START_KEYBOARD
+    )
 
+async def feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка отзыва через кнопки."""
+    query = update.callback_query
+    await query.answer()
+    if query.data == "feedback_yes":
+        context.user_data['awaiting_feedback'] = True
+        await query.edit_message_text("Пожалуйста, напишите ваш отзыв одним сообщением.")
+    else:
+        await query.edit_message_text("Спасибо! Если захотите оставить отзыв позже, используйте /feedback.")
+
+async def feedback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Приём текста отзыва."""
+    if context.user_data.get('awaiting_feedback'):
+        feedback = update.message.text
+        if AUTHOR_CHAT_ID:
+            try:
+                await context.bot.send_message(
+                    int(AUTHOR_CHAT_ID),
+                    f"📬 Новый отзыв\n\n{feedback}"
+                )
+            except Exception as e:
+                print(f"Не удалось отправить отзыв: {e}")
+        await update.message.reply_text("Спасибо за ваш отзыв!")
+        context.user_data.pop('awaiting_feedback', None)
+
+# ========== ПЛАТЁЖНЫЕ ОБРАБОТЧИКИ ==========
 async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_payment_configured():
         await update.pre_checkout_query.answer(ok=True)
@@ -603,134 +555,17 @@ async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.pre_checkout_query.answer(ok=False, error_message="Платежи временно недоступны.")
 
 async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_payment_configured():
-        await update.message.reply_text("Платежи отключены, сессия не может быть начата.")
-        return
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    db: Database = context.bot_data['db']
-
-    service_msg_id = context.user_data.get('service_message_id')
-    if service_msg_id:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=service_msg_id)
-        except:
-            pass
-        context.user_data.pop('service_message_id', None)
-    invoice_msg_id = context.user_data.get('invoice_message_id')
-    if invoice_msg_id:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=invoice_msg_id)
-        except:
-            pass
-        context.user_data.pop('invoice_message_id', None)
-
-    await update.message.reply_text("✅ Оплата прошла успешно! Сейчас начнём сессию.", reply_markup=END_KEYBOARD)
-    await start_session_core(chat_id, user_id, context, is_free=False)
-
-# ===== ОТЗЫВЫ =====
-async def ask_feedback(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("📝 Оставить отзыв", callback_data="feedback_yes")],
-        [InlineKeyboardButton("❌ Пропустить", callback_data="feedback_no")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="Вы можете оставить отзыв о прошедшей сессии, если захотите.",
-        reply_markup=reply_markup
+    await update.message.reply_text(
+        "✅ Оплата прошла успешно! Начинаем сеанс.",
+        reply_markup=ReplyKeyboardMarkup([["Завершить сессию"]], resize_keyboard=True)
     )
+    await start_session_core(chat_id, user_id, context)
 
-async def feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "feedback_yes":
-        context.user_data['awaiting_feedback'] = True
-        await query.edit_message_text("Пожалуйста, напишите Ваш отзыв одним сообщением. ⤵️")
-    else:
-        await query.edit_message_text("Если захотите оставить отзыв позже, просто напишите /feedback.")
-
-async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ask_feedback(update.effective_chat.id, context)
-
-async def view_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Просмотр отзывов отключён (хранение не ведётся).")
-
-# ===== ОБРАБОТЧИК СООБЩЕНИЙ =====
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_message = update.message.text
-    db: Database = context.bot_data['db']
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-
-    if context.user_data.get('awaiting_feedback'):
-        feedback_text = user_message
-        if AUTHOR_CHAT_ID:
-            try:
-                await context.bot.send_message(
-                    chat_id=int(AUTHOR_CHAT_ID),
-                    text=f"📬 Новый отзыв\n\n{feedback_text}"
-                )
-            except Exception as e:
-                print(f"Не удалось отправить отзыв автору: {e}")
-        await update.message.reply_text("Спасибо за ваш отзыв!", reply_markup=START_KEYBOARD)
-        context.user_data['awaiting_feedback'] = False
-        return
-
-    if user_message == "Начать сессию":
-        await start_session(update, context)
-        return
-    if user_message == "Завершить сессию":
-        await end(update, context)
-        return
-
-    session_id = context.user_data.get('session_id')
-    if not session_id:
-        await update.message.reply_text("Сейчас нет активной сессии. Нажмите «Начать сессию».", reply_markup=START_KEYBOARD)
-        return
-
-    await db.add_message(session_id, 'user', user_message)
-
-    history = await db.get_session_history(session_id, limit=MAX_HISTORY*2)
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for msg in history:
-        messages.append({"role": msg['role'], "content": msg['content']})
-
-    typing_task = asyncio.create_task(send_typing_periodically(chat_id, context))
-    context.user_data['typing_task'] = typing_task
-    try:
-        response = await asyncio.to_thread(
-            openai.ChatCompletion.create,
-            model="deepseek-chat",
-            messages=messages,
-            max_tokens=2500,
-            temperature=1
-        )
-        clean_reply = response.choices[0].message.content
-        await db.add_message(session_id, 'assistant', clean_reply)
-        parts = split_long_message(clean_reply)
-        for i, part in enumerate(parts):
-            if i == 0:
-                await update.message.reply_text(part, reply_markup=END_KEYBOARD)
-            else:
-                await update.message.reply_text(part)
-    except Exception as e:
-        print(f"❌ Ошибка при запросе к DeepSeek: {e}")
-        await update.message.reply_text("Извините, произошла техническая ошибка. Попробуйте позже.", reply_markup=END_KEYBOARD)
-    finally:
-        await stop_typing(typing_task)
-        context.user_data.pop('typing_task', None)
-
-    await finish_session(chat_id, context, is_timeout=False)
-
-async def end(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await finish_session(chat_id, context, is_timeout=False)
-
-# ===== ЗАПУСК =====
+# ========== ЗАПУСК ==========
 async def main():
-    lock = acquire_lock()                     # <-- захват блокировки
+    check_and_create_pid()
     print("🚀 Запуск бота...")
     db = Database(DATABASE_URL)
     await db.connect()
@@ -739,31 +574,26 @@ async def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.bot_data['db'] = db
 
-    # Очистка возможного старого вебхука
+    # Удаляем вебхук, если был
     await app.bot.delete_webhook()
 
-    app.add_handler(CommandHandler("start", start_session))
-    app.add_handler(CommandHandler("end", end))
-    app.add_handler(CommandHandler("feedback", feedback_command))
-    app.add_handler(CommandHandler("view_feedback", view_feedback))
-    app.add_handler(CommandHandler("resetdb", reset_db))
-    if PAYMENT_ENABLED:
-        app.add_handler(CommandHandler("buy", buy))
-        app.add_handler(PreCheckoutQueryHandler(pre_checkout))
-        app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-
+    # Обработчики
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Regex("^Начать сессию$"), start_session))
     app.add_handler(CallbackQueryHandler(free_consultation_callback, pattern="^free_consultation$"))
-    app.add_handler(CallbackQueryHandler(feedback_callback, pattern="^feedback_"))
-
+    app.add_handler(PreCheckoutQueryHandler(pre_checkout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(feedback_callback, pattern="^feedback_"))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^Завершить сессию$"), handle_message))
 
-    print("✅ Обработчики добавлены")
+    # Дополнительный обработчик для отзыва (текст)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_text))
 
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-
-    print("✅ Бот запущен и ожидает сообщения")
+    print("✅ Бот запущен, polling активен")
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -772,42 +602,16 @@ async def main():
 
     await stop_event.wait()
 
-    print("🛑 Остановка бота...")
+    print("🛑 Остановка...")
     await app.updater.stop()
     await app.stop()
     await app.shutdown()
     await db.close()
-    lock.close()                              # <-- освобождение блокировки
+    remove_pid()
     print("✅ Бот остановлен")
 
-async def reset_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if AUTHOR_CHAT_ID and update.effective_user.id != int(AUTHOR_CHAT_ID):
-        await update.message.reply_text("⛔ Недостаточно прав для выполнения этой команды.")
-        return
-
-    db: Database = context.bot_data['db']
-    await update.message.reply_text("⚠️ Сброс базы данных... Это удалит все данные пользователей, сессий и сообщений.")
-
-    try:
-        async with db.pool.acquire() as conn:
-            await conn.execute("DROP SCHEMA public CASCADE")
-            await conn.execute("CREATE SCHEMA public")
-            await conn.execute("GRANT ALL ON SCHEMA public TO public")
-        await db.init_tables()
-        await update.message.reply_text("✅ База данных успешно сброшена и таблицы пересозданы.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при сбросе базы: {e}")
-
 if __name__ == "__main__":
-    import asyncio
-    import signal
-
     try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop is None:
         asyncio.run(main())
-    else:
-        loop.create_task(main())
+    except KeyboardInterrupt:
+        pass
