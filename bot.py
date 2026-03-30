@@ -6,10 +6,9 @@ import json
 import signal
 import logging
 import fcntl
-import re
-from dotenv import load_dotenv
-from openai import AsyncOpenAI
+import openai
 import asyncpg
+from dotenv import load_dotenv
 from telegram import (
     Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup,
     LabeledPrice
@@ -34,13 +33,14 @@ DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 DATABASE_URL = os.getenv('DATABASE_URL')
 PAYMENT_PROVIDER_TOKEN = os.getenv('PAYMENT_PROVIDER_TOKEN')
 CURRENCY = os.getenv('CURRENCY', 'RUB')
-PRICE = 10000                     # 100.00 RUB (в копейках)
-COOLDOWN_SECONDS = 12 * 60 * 60   # 12 часов
+PRICE = int(os.getenv('PRICE', 10000))
 AUTHOR_CHAT_ID = os.getenv('AUTHOR_CHAT_ID')
 
 USE_AI_WELCOME = os.getenv('USE_AI_WELCOME', 'True').lower() in ('true', '1', 'yes')
 PAYMENT_ENABLED = os.getenv('PAYMENT_ENABLED', 'False').lower() in ('true', '1', 'yes')
 FREE_CONSULTATION_ENABLED = os.getenv('FREE_CONSULTATION_ENABLED', 'True').lower() in ('true', '1', 'yes')
+
+COOLDOWN_SECONDS = 12 * 60 * 60   # 12 часов
 
 FREE_CONSULTATION_TEXT = (
     "✨ Я — виртуальный таролог.✨\n\n"
@@ -159,8 +159,8 @@ if not DATABASE_URL:
     logger.error("DATABASE_URL не задан!")
     sys.exit(1)
 
-# Асинхронный клиент DeepSeek
-client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1")
+openai.api_base = "https://api.deepseek.com/v1"
+openai.api_key = DEEPSEEK_API_KEY
 
 def is_payment_configured():
     return PAYMENT_ENABLED and PAYMENT_PROVIDER_TOKEN and ':' in PAYMENT_PROVIDER_TOKEN
@@ -213,25 +213,6 @@ class Database:
                     created_at TIMESTAMPTZ DEFAULT now()
                 )
             """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS promocodes (
-                    id SERIAL PRIMARY KEY,
-                    code TEXT UNIQUE NOT NULL,
-                    max_uses INTEGER DEFAULT 1,
-                    used_count INTEGER DEFAULT 0,
-                    is_active BOOLEAN DEFAULT true,
-                    created_at TIMESTAMPTZ DEFAULT now()
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS promo_usage (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
-                    promo_id INTEGER REFERENCES promocodes(id),
-                    used_at TIMESTAMPTZ DEFAULT now(),
-                    UNIQUE(user_id, promo_id)
-                )
-            """)
         logger.info("Таблицы инициализированы")
 
     async def get_or_create_user(self, user_id):
@@ -269,95 +250,23 @@ class Database:
     async def reset_database(self):
         async with self.pool.acquire() as conn:
             await conn.execute("DROP TABLE IF EXISTS users CASCADE")
-            await conn.execute("DROP TABLE IF EXISTS promocodes CASCADE")
-            await conn.execute("DROP TABLE IF EXISTS promo_usage CASCADE")
             await self.init_tables()
         logger.info("База данных сброшена")
 
-    # ========== ПРОМОКОДЫ ==========
-    async def use_promo(self, code: str, user_id: int) -> bool:
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                promo = await conn.fetchrow(
-                    "SELECT id, max_uses, used_count FROM promocodes WHERE code = $1 AND is_active = true",
-                    code
-                )
-                if not promo:
-                    logger.info(f"Попытка использовать недействительный промокод: {code}")
-                    return False
-
-                existing = await conn.fetchval(
-                    "SELECT 1 FROM promo_usage WHERE user_id = $1 AND promo_id = $2",
-                    user_id, promo['id']
-                )
-                if existing:
-                    logger.info(f"Пользователь {user_id} повторно пытается использовать промокод {code}")
-                    return False
-
-                if promo['used_count'] >= promo['max_uses']:
-                    logger.info(f"Промокод {code} исчерпал лимит использований")
-                    return False
-
-                await conn.execute(
-                    "UPDATE promocodes SET used_count = used_count + 1 WHERE id = $1",
-                    promo['id']
-                )
-                await conn.execute(
-                    "INSERT INTO promo_usage (user_id, promo_id) VALUES ($1, $2)",
-                    user_id, promo['id']
-                )
-                logger.info(f"Пользователь {user_id} успешно использовал промокод {code}")
-                return True
-
-    async def has_used_promo(self, user_id: int) -> bool:
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchval(
-                "SELECT 1 FROM promo_usage WHERE user_id = $1 LIMIT 1",
-                user_id
-            )
-            return bool(row)
-
-    async def add_promo(self, code: str, max_uses: int) -> bool:
-        async with self.pool.acquire() as conn:
-            try:
-                await conn.execute(
-                    "INSERT INTO promocodes (code, max_uses) VALUES ($1, $2)",
-                    code, max_uses
-                )
-                logger.info(f"Создан промокод {code} с лимитом {max_uses}")
-                return True
-            except Exception as e:
-                logger.error(f"Ошибка создания промокода: {e}")
-                return False
-
-    async def list_promos(self):
-        async with self.pool.acquire() as conn:
-            return await conn.fetch("""
-                SELECT code, max_uses, used_count, is_active
-                FROM promocodes
-                ORDER BY created_at DESC
-            """)
-
-    async def disable_promo(self, code: str):
-        async with self.pool.acquire() as conn:
-            return await conn.execute(
-                "UPDATE promocodes SET is_active = false WHERE code = $1",
-                code
-            )
-
 # ========== AI ФУНКЦИИ ==========
-ai_semaphore = asyncio.Semaphore(5)
-
 async def generate_welcome_message():
     welcome_prompt = "Ты — виртуальный таролог. Напиши краткое приветствие для пользователя, который готов задать вопрос. Объясни, что чем подробнее он опишет ситуацию, тем точнее будет расклад. Не используй Markdown."
     try:
-        async with ai_semaphore:
-            response = await client.chat.completions.create(
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                openai.ChatCompletion.create,
                 model="deepseek-chat",
                 messages=[{"role": "user", "content": welcome_prompt}],
                 max_tokens=500,
                 temperature=0.7
-            )
+            ),
+            timeout=30
+        )
         return response.choices[0].message.content.strip()
     except asyncio.TimeoutError:
         logger.error("Таймаут генерации приветствия")
@@ -378,14 +287,16 @@ async def ask_ai(question, history):
         messages.append(msg)
     messages.append({"role": "user", "content": question})
     try:
-        async with ai_semaphore:
-            response = await client.chat.completions.create(
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                openai.ChatCompletion.create,
                 model="deepseek-chat",
                 messages=messages,
                 max_tokens=2000,
-                temperature=0.8,
-                timeout=60
-            )
+                temperature=0.8
+            ),
+            timeout=60
+        )
         return response.choices[0].message.content
     except asyncio.TimeoutError:
         logger.error("Таймаут AI запроса")
@@ -465,14 +376,13 @@ def load_translations():
         return {}
 
 def translate_card_names(text: str, translations: dict) -> str:
-    """Заменяет английские названия карт на русские в тексте, используя границы слов."""
+    """Заменяет английские названия карт на русские в тексте."""
     if not translations:
         return text
+    # Сортируем ключи по убыванию длины, чтобы сначала заменять длинные названия
     for eng_name in sorted(translations.keys(), key=len, reverse=True):
         rus_name = translations[eng_name]
-        # Используем границы слов, чтобы не заменять части слов
-        pattern = r'\b' + re.escape(eng_name) + r'\b'
-        text = re.sub(pattern, rus_name, text)
+        text = text.replace(eng_name, rus_name)
     return text
 
 # ========== ПАРСИНГ ОТВЕТА AI ==========
@@ -492,7 +402,6 @@ def parse_ai_response(answer: str):
     pos_analysis = answer.find(header_analysis)
 
     if pos_cards == -1 or pos_analysis == -1:
-        # Fallback: не удалось распарсить, возвращаем None для intro
         return None, None, None, answer
 
     intro = answer[:pos_cards].strip()
@@ -540,14 +449,17 @@ async def can_start_session(user_id, db, context, is_free=False):
     if context.user_data.get('state') == 'awaiting_question':
         return False, "У вас уже есть активная сессия. Завершите её или задайте вопрос."
 
-    # Проверка кулдауна только для платных сессий
-    if not is_free:
-        last_end = await db.get_last_session_end(user_id)
-        if last_end and (time.time() - last_end) < COOLDOWN_SECONDS:
-            remaining = COOLDOWN_SECONDS - (time.time() - last_end)
-            hours = int(remaining // 3600)
-            minutes = int((remaining % 3600) // 60)
-            return False, f"🌙 Картам нужно время, чтобы их образы улеглись в душе.\nСледующий расклад будет доступен через {hours} ч {minutes} мин.\nПриходите позже — мудрость не терпит спешки."
+    last_end = await db.get_last_session_end(user_id)
+    if last_end and (time.time() - last_end) < COOLDOWN_SECONDS:
+        remaining = COOLDOWN_SECONDS - (time.time() - last_end)
+        hours = int(remaining // 3600)
+        minutes = int((remaining % 3600) // 60)
+        return False, f"🌙 Картам нужно время, чтобы их образы улеглись в душе.\nСледующий расклад будет доступен через {hours} ч {minutes} мин.\nПриходите позже — мудрость не терпит спешки."
+
+    if is_free:
+        free_used = await db.is_free_used(user_id)
+        if free_used:
+            return False, "Вы уже использовали бесплатную сессию."
 
     return True, None
 
@@ -565,13 +477,11 @@ async def start_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await db.get_or_create_user(user_id)
 
-    # Проверка кулдауна и активной сессии
     can, msg = await can_start_session(user_id, db, context, is_free=False)
     if not can:
         await update.message.reply_text(msg, reply_markup=START_KEYBOARD)
         return
 
-    # Бесплатная консультация
     if FREE_CONSULTATION_ENABLED and not await db.is_free_used(user_id):
         await update.message.reply_text(
             FREE_CONSULTATION_TEXT,
@@ -580,35 +490,29 @@ async def start_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Если оплата не настроена, запускаем бесплатно (но с кулдауном)
-    if not is_payment_configured():
-        await start_session_core(chat_id, user_id, context, is_free=False)
+    if is_payment_configured():
+        service_text = (
+            "✨ Я — виртуальный таролог.✨\n\n"
+            "Я работаю с классической колодой Райдера—Уэйта и глубокой символикой.\n\n"
+            "Как проходит сеанс:\n"
+            "1. Вы задаёте любой вопрос (отношения, работа, выбор, саморазвитие).\n"
+            "2. Я вытягиваю для вас 3 случайные карты Таро.\n"
+            "3. Даю подробный разбор:\n"
+            "• значение каждой карты (символы, детали, смысл)\n"
+            "• их взаимодействие друг с другом\n"
+            "• общий синтез — ответ на ваш вопрос\n"
+            "4. При необходимости — итоговая карта-квинтэссенция.\n\n"
+            "Карты — не предсказание, а зеркало вашей души.\n"
+            "Я помогаю увидеть скрытые грани ситуации, найти ресурсы и принять осознанное решение.\n\n"
+            f"💰 Стоимость одного расклада — {PRICE/100} {CURRENCY}\n\n"
+            "Сразу после оплаты вы сможете задать свой вопрос.\n\n"
+            "Готовы заглянуть в себя? 🔮"
+        )
+        await update.message.reply_text(service_text, parse_mode='Markdown')
+        await send_invoice(chat_id, context)
         return
 
-    # Оплата и промокод
-    service_text = (
-        "✨ Я — виртуальный таролог.✨\n\n"
-        "Я работаю с классической колодой Райдера—Уэйта и глубокой символикой.\n\n"
-        "Как проходит сеанс:\n"
-        "1. Вы задаёте любой вопрос (отношения, работа, выбор, саморазвитие).\n"
-        "2. Я вытягиваю для вас 3 случайные карты Таро.\n"
-        "3. Даю подробный разбор:\n"
-        "• значение каждой карты (символы, детали, смысл)\n"
-        "• их взаимодействие друг с другом\n"
-        "• общий синтез — ответ на ваш вопрос\n"
-        "4. При необходимости — итоговая карта-квинтэссенция.\n\n"
-        "Карты — не предсказание, а зеркало вашей души.\n"
-        "Я помогаю увидеть скрытые грани ситуации, найти ресурсы и принять осознанное решение.\n\n"
-        f"💰 Стоимость одного расклада — {PRICE/100} {CURRENCY}\n\n"
-        "Если у вас есть промокод на бесплатный расклад, введите его в поле для сообщения и нажмите отправить.\n\n"
-        "Готовы заглянуть в себя? 🔮"
-    )
-    await update.message.reply_text(service_text, parse_mode='Markdown')
-    await send_invoice(chat_id, context)
-
-    context.user_data['state'] = 'awaiting_promo_code'
-    context.user_data['chat_id'] = chat_id
-    context.user_data['user_id'] = user_id
+    await start_session_core(chat_id, user_id, context, is_free=False)
 
 async def free_consultation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -617,7 +521,6 @@ async def free_consultation_callback(update: Update, context: ContextTypes.DEFAU
     chat_id = query.message.chat_id
     db: Database = context.bot_data['db']
 
-    # Проверяем возможность начать сессию с is_free=True
     can, msg = await can_start_session(user_id, db, context, is_free=True)
     if not can:
         await query.edit_message_text(msg)
@@ -663,29 +566,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['state'] = 'idle'
         return
 
-    # Обработка ввода промокода
-    if context.user_data.get('state') == 'awaiting_promo_code':
-        if context.user_data.get('user_id') != user_id:
-            await update.message.reply_text("Сейчас ожидается ввод промокода от другого пользователя.")
-            return
-
-        code = user_message.strip()
-        success = await db.use_promo(code, user_id)
-
-        if success:
-            await update.message.reply_text("✅ Промокод принят! Начинаем бесплатный расклад.")
-            context.user_data.clear()
-            # Помечаем, что это сессия по промокоду, чтобы не проверять free_used
-            context.user_data['is_promo_session'] = True
-            await start_session_core(chat_id, user_id, context, is_free=True)
-        else:
-            await update.message.reply_text(
-                "❌ Неверный или уже использованный промокод.\n"
-                "Если вы хотите оплатить расклад, нажмите кнопку 'Оплатить' в сообщении с инвойсом."
-            )
-        return
-
-    # Завершение сессии
     if user_message == "Завершить сессию":
         if context.user_data.get('state') == 'awaiting_question':
             context.user_data.clear()
@@ -723,14 +603,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         translations = context.bot_data.get('translations', {})
         card_images = context.bot_data.get('card_images', {})
 
-        # Обновляем last_session_end независимо от успеха парсинга
-        try:
-            await db.update_last_session_end(user_id)
-        except Exception as e:
-            logger.error(f"Ошибка обновления last_session_end: {e}")
-
-        # Если парсинг не удался, отправляем ответ целиком
         if intro is None:
+            # Не удалось распарсить – отправляем как есть
             if len(answer) > 4096:
                 for i in range(0, len(answer), 4096):
                     await update.message.reply_text(answer[i:i+4096])
@@ -772,8 +646,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await update.message.reply_text(rest_translated)
 
-        context.user_data.clear()
-        context.user_data['state'] = 'idle'
+        try:
+            await db.update_last_session_end(user_id)
+        except Exception as e:
+            logger.error(f"Ошибка обновления last_session_end: {e}")
+        finally:
+            context.user_data.clear()
+            context.user_data['state'] = 'idle'
 
         await update.message.reply_text("✨", reply_markup=START_KEYBOARD)
         await ask_feedback(chat_id, context)
@@ -805,18 +684,10 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_id = update.effective_chat.id
     db: Database = context.bot_data['db']
 
-    if context.user_data.get('state') == 'awaiting_question':
-        await update.message.reply_text("У вас уже есть активная сессия. Завершите её или задайте вопрос.")
-        return
-
     can, msg = await can_start_session(user_id, db, context, is_free=False)
     if not can:
         await update.message.reply_text(msg)
         return
-
-    # Сброс состояния ожидания промокода, если оно было
-    if context.user_data.get('state') == 'awaiting_promo_code':
-        context.user_data.clear()
 
     await update.message.reply_text(
         "✅ Оплата прошла успешно! Начинаем сеанс.",
@@ -824,99 +695,9 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     await start_session_core(chat_id, user_id, context, is_free=False)
 
-# ========== АДМИНИСТРАТИВНЫЕ КОМАНДЫ ==========
-async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not AUTHOR_CHAT_ID or update.effective_user.id != int(AUTHOR_CHAT_ID):
-        await update.message.reply_text("⛔ Недостаточно прав.")
-        return
-
-    commands = [
-        "/start - начать работу с ботом",
-        "/resetdb - сбросить базу данных (требует подтверждения)",
-        "/resetdb_confirm - подтвердить сброс БД",
-        "/create_promo КОД ЛИМИТ - создать промокод",
-        "/list_promo - показать список промокодов",
-        "/disable_promo КОД - деактивировать промокод",
-        "/test_free - запустить тестовую бесплатную сессию"
-    ]
-    help_text = "🔧 **Административные команды:**\n" + "\n".join(commands)
-    await update.message.reply_text(help_text, parse_mode='Markdown')
-
-async def test_free(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not AUTHOR_CHAT_ID or update.effective_user.id != int(AUTHOR_CHAT_ID):
-        await update.message.reply_text("⛔ Недостаточно прав.")
-        return
-
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    db: Database = context.bot_data['db']
-
-    await db.get_or_create_user(user_id)
-    await start_session_core(chat_id, user_id, context, is_free=True)
-    await update.message.reply_text("✅ Тестовая сессия запущена.")
-
-async def list_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not AUTHOR_CHAT_ID or update.effective_user.id != int(AUTHOR_CHAT_ID):
-        await update.message.reply_text("⛔ Недостаточно прав.")
-        return
-
-    db: Database = context.bot_data['db']
-    rows = await db.list_promos()
-    if not rows:
-        await update.message.reply_text("Промокодов пока нет.")
-        return
-
-    text = "📋 **Список промокодов:**\n"
-    for row in rows:
-        status = "✅ активен" if row['is_active'] else "❌ неактивен"
-        text += f"`{row['code']}` – использовано {row['used_count']}/{row['max_uses']} ({status})\n"
-    await update.message.reply_text(text, parse_mode='Markdown')
-
-async def disable_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not AUTHOR_CHAT_ID or update.effective_user.id != int(AUTHOR_CHAT_ID):
-        await update.message.reply_text("⛔ Недостаточно прав.")
-        return
-
-    args = context.args
-    if not args:
-        await update.message.reply_text("Использование: /disable_promo КОД")
-        return
-
-    code = args[0].strip()
-    db: Database = context.bot_data['db']
-    result = await db.disable_promo(code)
-    if result == "UPDATE 0":
-        await update.message.reply_text(f"❌ Промокод {code} не найден.")
-    else:
-        await update.message.reply_text(f"✅ Промокод {code} деактивирован.")
-
-async def create_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not AUTHOR_CHAT_ID or update.effective_user.id != int(AUTHOR_CHAT_ID):
-        await update.message.reply_text("⛔ Недостаточно прав.")
-        return
-
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Использование: /create_promo КОД ЛИМИТ")
-        return
-
-    code = args[0].strip()
-    try:
-        max_uses = int(args[1])
-    except ValueError:
-        await update.message.reply_text("Лимит должен быть числом.")
-        return
-
-    db: Database = context.bot_data['db']
-    success = await db.add_promo(code, max_uses)
-    if success:
-        await update.message.reply_text(f"✅ Промокод {code} создан (лимит {max_uses})")
-    else:
-        await update.message.reply_text("❌ Не удалось создать промокод (возможно, такой код уже существует).")
-
 # ========== КОМАНДА СБРОСА БД ==========
 async def resetdb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not AUTHOR_CHAT_ID or update.effective_user.id != int(AUTHOR_CHAT_ID):
+    if AUTHOR_CHAT_ID and update.effective_user.id != int(AUTHOR_CHAT_ID):
         await update.message.reply_text("⛔ Недостаточно прав для выполнения этой команды.")
         return
 
@@ -928,7 +709,7 @@ async def resetdb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def resetdb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not AUTHOR_CHAT_ID or update.effective_user.id != int(AUTHOR_CHAT_ID):
+    if AUTHOR_CHAT_ID and update.effective_user.id != int(AUTHOR_CHAT_ID):
         await update.message.reply_text("⛔ Недостаточно прав.")
         return
 
@@ -963,25 +744,17 @@ async def main():
         app.bot_data['card_images'] = card_images
         app.bot_data['translations'] = translations
 
-        # Удаляем вебхук с повторной проверкой
-        for _ in range(3):
+        await app.bot.delete_webhook()
+        await asyncio.sleep(1)
+        webhook_info = await app.bot.get_webhook_info()
+        if webhook_info.url:
+            logger.warning(f"Вебхук всё ещё установлен: {webhook_info.url}. Повторная попытка удаления...")
             await app.bot.delete_webhook()
             await asyncio.sleep(1)
-            webhook_info = await app.bot.get_webhook_info()
-            if not webhook_info.url:
-                break
-        else:
-            logger.warning("Не удалось удалить вебхук после трёх попыток")
 
-        # Регистрация обработчиков
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("resetdb", resetdb))
         app.add_handler(CommandHandler("resetdb_confirm", resetdb_confirm))
-        app.add_handler(CommandHandler("create_promo", create_promo))
-        app.add_handler(CommandHandler("list_promo", list_promo))
-        app.add_handler(CommandHandler("disable_promo", disable_promo))
-        app.add_handler(CommandHandler("test_free", test_free))
-        app.add_handler(CommandHandler("admin_help", admin_help))
         app.add_handler(MessageHandler(filters.Regex("^Начать сессию$"), start_session))
         app.add_handler(CallbackQueryHandler(free_consultation_callback, pattern="^free_consultation$"))
         app.add_handler(PreCheckoutQueryHandler(pre_checkout))
