@@ -6,6 +6,7 @@ import json
 import signal
 import logging
 import fcntl
+import re
 import openai
 import asyncpg
 from dotenv import load_dotenv
@@ -38,11 +39,10 @@ AUTHOR_CHAT_ID = os.getenv('AUTHOR_CHAT_ID')
 
 USE_AI_WELCOME = os.getenv('USE_AI_WELCOME', 'True').lower() in ('true', '1', 'yes')
 PAYMENT_ENABLED = os.getenv('PAYMENT_ENABLED', 'False').lower() in ('true', '1', 'yes')
-FREE_CONSULTATION_ENABLED = os.getenv('FREE_CONSULTATION_ENABLED', 'True').lower() in ('true', '1', 'yes')
 
-COOLDOWN_SECONDS = 12 * 60 * 60   # 12 часов
+COOLDOWN_SECONDS = 24 * 60 * 60   # 12 часов
 
-FREE_CONSULTATION_TEXT = (
+DESCRIPTION_TEXT = (
     "✨ Я — виртуальный таролог.✨\n\n"
     "Я работаю с классической колодой Райдера—Уэйта и глубокой символикой.\n\n"
     "Как проходит сеанс:\n"
@@ -55,14 +55,10 @@ FREE_CONSULTATION_TEXT = (
     "4. При необходимости — итоговая карта-квинтэссенция.\n\n"
     "Карты — не предсказание, а зеркало вашей души.\n"
     "Я помогаю увидеть скрытые грани ситуации, найти ресурсы и принять осознанное решение.\n\n"
-    "Ваш первый расклад — **бесплатный!**.\n\n"
     "Готовы заглянуть в себя? 🔮"
 )
 
 START_KEYBOARD = ReplyKeyboardMarkup([["Начать сессию"]], resize_keyboard=True)
-FREE_KEYBOARD = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🎁 Сделать бесплатный расклад", callback_data="free_consultation")]
-])
 
 # ========== СИСТЕМНЫЙ ПРОМПТ (английские названия, строгая структура) ==========
 SYSTEM_PROMPT = """
@@ -93,8 +89,7 @@ SYSTEM_PROMPT = """
    1. **The Fool** (Старший аркан)
    2. **Two of Cups** (Младший аркан, масть Кубки)
    3. **Ten of Swords** (Младший аркан, масть Мечи)
-   4. **Eight of Wands** (Младший аркан, масть Жезлы)
-   5. **Six of Pentacles** (Младший аркан, масть Пентакли)
+   
 3. Заголовок **"Разбор каждой карты:"**. Далее для каждой карты строго по шаблону:
    *   **Название карты на английском** (аркан, масть): текст разбора (3–5 предложений)...
    (Обязательно начинать строку с "*   **", затем название, затем "**", затем скобки с арканом, двоеточие и описание).
@@ -208,9 +203,23 @@ class Database:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY,
-                    free_used BOOLEAN DEFAULT false,
                     last_session_end TIMESTAMPTZ,
                     created_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+                    question TEXT,
+                    created_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS banned_users (
+                    user_id BIGINT PRIMARY KEY,
+                    reason TEXT,
+                    banned_at TIMESTAMPTZ DEFAULT now()
                 )
             """)
         logger.info("Таблицы инициализированы")
@@ -220,18 +229,6 @@ class Database:
             await conn.execute(
                 "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
                 user_id
-            )
-
-    async def is_free_used(self, user_id):
-        async with self.pool.acquire() as conn:
-            return await conn.fetchval(
-                "SELECT free_used FROM users WHERE user_id = $1", user_id
-            ) or False
-
-    async def set_free_used(self, user_id):
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET free_used = true WHERE user_id = $1", user_id
             )
 
     async def update_last_session_end(self, user_id):
@@ -247,6 +244,45 @@ class Database:
             )
             return row.timestamp() if row else None
 
+    async def log_session(self, user_id, question=None):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO sessions (user_id, question) VALUES ($1, $2)",
+                user_id, question
+            )
+
+    async def is_banned(self, user_id):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT 1 FROM banned_users WHERE user_id = $1", user_id
+            ) is not None
+
+    async def ban_user(self, user_id, reason=None):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO banned_users (user_id, reason) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                user_id, reason
+            )
+
+    async def unban_user(self, user_id):
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM banned_users WHERE user_id = $1", user_id)
+
+    async def get_stats(self):
+        async with self.pool.acquire() as conn:
+            total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+            total_sessions = await conn.fetchval("SELECT COUNT(*) FROM sessions")
+            banned_count = await conn.fetchval("SELECT COUNT(*) FROM banned_users")
+            return {
+                "total_users": total_users,
+                "total_sessions": total_sessions,
+                "banned_users": banned_count
+            }
+
+    async def get_all_users(self):
+        async with self.pool.acquire() as conn:
+            return [row["user_id"] async for row in conn.fetch("SELECT user_id FROM users")]
+
     async def reset_database(self):
         async with self.pool.acquire() as conn:
             await conn.execute("DROP TABLE IF EXISTS users CASCADE")
@@ -255,7 +291,7 @@ class Database:
 
 # ========== AI ФУНКЦИИ ==========
 async def generate_welcome_message():
-    welcome_prompt = "Ты — виртуальный таролог. Напиши краткое приветствие для пользователя, который готов задать вопрос. Объясни, что чем подробнее он опишет ситуацию, тем точнее будет расклад. Не используй Markdown."
+    welcome_prompt = "Ты — виртуальный таролог. Предложи пользователю задать вопрос. Объясни, что чем подробнее и детальнее он опишет свой вопрос, тем точнее будет расклад. Не используй Markdown."
     try:
         response = await asyncio.wait_for(
             asyncio.to_thread(
@@ -263,7 +299,7 @@ async def generate_welcome_message():
                 model="deepseek-chat",
                 messages=[{"role": "user", "content": welcome_prompt}],
                 max_tokens=500,
-                temperature=0.7
+                temperature=1
             ),
             timeout=30
         )
@@ -276,7 +312,7 @@ async def generate_welcome_message():
         return get_default_welcome()
 
 def get_default_welcome():
-    return ("Добро пожаловать. Я — таролог, работающий с мудростью колоды Райдера—Уэйта. "
+    return ("Добро пожаловать. Я — таролог, работающий с мудростью колоды Таро. "
             "Я готов выслушать ваш вопрос и обратиться к картам.\n\n"
             "Чтобы образы и символы заговорили с вами максимально ясно, пожалуйста, опишите вашу ситуацию или вопрос как можно подробнее. "
             "Чем больше деталей вы предоставите, тем глубже и точнее будет наше совместное путешествие к пониманию. Я жду вашего вопроса.")
@@ -293,7 +329,7 @@ async def ask_ai(question, history):
                 model="deepseek-chat",
                 messages=messages,
                 max_tokens=2000,
-                temperature=0.8
+                temperature=1
             ),
             timeout=60
         )
@@ -306,7 +342,7 @@ async def ask_ai(question, history):
         return "Извините, произошла ошибка. Попробуйте позже."
 
 # ========== ПЛАТЕЖИ ==========
-async def send_invoice(chat_id, context):
+async def send_invoice(chat_id, context, payload="cooldown_bypass"):
     if not is_payment_configured():
         return
     prices = [LabeledPrice(label="Расклад Таро", amount=PRICE)]
@@ -324,8 +360,8 @@ async def send_invoice(chat_id, context):
         await context.bot.send_invoice(
             chat_id=chat_id,
             title="Оплата расклада",
-            description="Один расклад Таро (3 карты с подробным разбором)",
-            payload="tarot_payment",
+            description="Получить расклад сейчас.",
+            payload=payload,
             provider_token=PAYMENT_PROVIDER_TOKEN,
             currency=CURRENCY,
             prices=prices,
@@ -347,7 +383,7 @@ async def ask_feedback(chat_id, context):
     ]
     await context.bot.send_message(
         chat_id,
-        "Вы можете оставить отзыв если захотите.",
+        "Вы можете поделиться впечатлениями о прошедшей сессии если захотите.",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -376,10 +412,8 @@ def load_translations():
         return {}
 
 def translate_card_names(text: str, translations: dict) -> str:
-    """Заменяет английские названия карт на русские в тексте."""
     if not translations:
         return text
-    # Сортируем ключи по убыванию длины, чтобы сначала заменять длинные названия
     for eng_name in sorted(translations.keys(), key=len, reverse=True):
         rus_name = translations[eng_name]
         text = text.replace(eng_name, rus_name)
@@ -387,13 +421,6 @@ def translate_card_names(text: str, translations: dict) -> str:
 
 # ========== ПАРСИНГ ОТВЕТА AI ==========
 def parse_ai_response(answer: str):
-    """
-    Разбирает ответ AI на:
-    - intro: текст до "**Выпавшие карты:**"
-    - cards_list: текст между "**Выпавшие карты:**" и "**Разбор каждой карты:**"
-    - card_details: список кортежей (название_карты, описание) из раздела "Разбор каждой карты"
-    - rest: текст после "**Разбор каждой карты:**" (синтез, квинтэссенция, общий ответ)
-    """
     header_cards = "**Выпавшие карты:**"
     header_analysis = "**Разбор каждой карты:**"
     header_synthesis = "**Синтез и взаимодействие:**"
@@ -444,24 +471,197 @@ def parse_ai_response(answer: str):
 
     return intro, cards_section, card_details, rest
 
+def split_rest_sections(rest: str):
+    sections = {
+        'synthesis': None,
+        'quintessence': None,
+        'general_answer': None,
+        'extra': None
+    }
+    headers = {
+        'synthesis': '**Синтез и взаимодействие:**',
+        'quintessence': '**Квинтэссенция:**',
+        'general_answer': '**Общий ответ на ваш вопрос:**'
+    }
+    
+    pos_synth = rest.find(headers['synthesis'])
+    pos_quint = rest.find(headers['quintessence'])
+    pos_answer = rest.find(headers['general_answer'])
+    
+    if pos_synth == -1:
+        sections['extra'] = rest
+        return sections
+    
+    next_pos = len(rest)
+    if pos_quint != -1 and pos_quint > pos_synth:
+        next_pos = pos_quint
+    elif pos_answer != -1 and pos_answer > pos_synth:
+        next_pos = pos_answer
+    sections['synthesis'] = rest[pos_synth:next_pos].strip()
+    
+    if pos_quint != -1:
+        next_pos = len(rest)
+        if pos_answer != -1 and pos_answer > pos_quint:
+            next_pos = pos_answer
+        sections['quintessence'] = rest[pos_quint:next_pos].strip()
+    
+    if pos_answer != -1:
+        sections['general_answer'] = rest[pos_answer:].strip()
+    else:
+        if sections['synthesis']:
+            remaining = rest[pos_synth + len(headers['synthesis']):].strip()
+            if remaining and not sections['quintessence'] and not sections['general_answer']:
+                sections['extra'] = remaining
+    
+    return sections
+
+def extract_quintessence_card_name(quintessence_text: str, translations: dict) -> str:
+    if not quintessence_text or not translations:
+        return None
+
+    patterns = [
+        r'соответствует аркану\s+[**]?([А-Яа-яё\s]+?)[**]?\s*(?:[.,;]|$)',
+        r'аркан\s+[**]?([А-Яа-яё\s]+?)[**]?\s*(?:[.,;]|$)',
+        r'аркану\s+[**]?([А-Яа-яё\s]+?)[**]?\s*(?:[.,;]|$)'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, quintessence_text, re.IGNORECASE)
+        if match:
+            card_name_rus = match.group(1).strip()
+            for eng_name, rus_name in translations.items():
+                if rus_name == card_name_rus:
+                    return eng_name
+            for eng_name, rus_name in translations.items():
+                if card_name_rus in rus_name or rus_name in card_name_rus:
+                    return eng_name
+            return None
+
+    found = []
+    for eng_name in translations.keys():
+        if eng_name in quintessence_text:
+            pos = quintessence_text.rfind(eng_name)
+            found.append((pos, eng_name))
+    if found:
+        found.sort(key=lambda x: x[0], reverse=True)
+        return found[0][1]
+    return None
+
+# ========== ОТПРАВКА ОТВЕТА AI ==========
+async def send_ai_response(update: Update, context: ContextTypes.DEFAULT_TYPE, answer: str):
+    intro, cards_section, card_details, rest = parse_ai_response(answer)
+    translations = context.bot_data.get('translations', {})
+    card_images = context.bot_data.get('card_images', {})
+
+    if intro is None:
+        if len(answer) > 4096:
+            for i in range(0, len(answer), 4096):
+                await update.message.reply_text(answer[i:i+4096])
+        else:
+            await update.message.reply_text(answer)
+        return
+
+    first_part = translate_card_names(intro, translations)
+    if cards_section:
+        first_part += f"\n\n**Выпавшие карты:**\n{translate_card_names(cards_section, translations)}"
+    await update.message.reply_text(first_part)
+
+    for eng_name, description in card_details:
+        rus_name = translations.get(eng_name, eng_name)
+        file_id = card_images.get(eng_name)
+        if file_id:
+            try:
+                await context.bot.send_photo(chat_id=update.effective_chat.id, photo=file_id, caption=rus_name)
+            except Exception as e:
+                logger.error(f"Ошибка отправки фото для {eng_name}: {e}")
+        else:
+            logger.warning(f"Нет изображения для карты: {eng_name}")
+
+        if description:
+            desc_translated = translate_card_names(description, translations)
+            if len(desc_translated) > 4096:
+                for i in range(0, len(desc_translated), 4096):
+                    await update.message.reply_text(desc_translated[i:i+4096])
+            else:
+                await update.message.reply_text(desc_translated)
+
+    if not rest:
+        return
+
+    sections = split_rest_sections(rest)
+
+    if sections['synthesis']:
+        synth_translated = translate_card_names(sections['synthesis'], translations)
+        if len(synth_translated) > 4096:
+            for i in range(0, len(synth_translated), 4096):
+                await update.message.reply_text(synth_translated[i:i+4096])
+        else:
+            await update.message.reply_text(synth_translated)
+
+    if sections['quintessence']:
+        quint_text = sections['quintessence']
+        quint_translated = translate_card_names(quint_text, translations)
+        if len(quint_translated) > 4096:
+            for i in range(0, len(quint_translated), 4096):
+                await update.message.reply_text(quint_translated[i:i+4096])
+        else:
+            await update.message.reply_text(quint_translated)
+
+        card_name = extract_quintessence_card_name(quint_text, translations)
+        if card_name:
+            file_id = card_images.get(card_name)
+            if file_id:
+                rus_name = translations.get(card_name, card_name)
+                try:
+                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=file_id, caption=rus_name)
+                except Exception as e:
+                    logger.error(f"Ошибка отправки фото для квинтэссенции {card_name}: {e}")
+            else:
+                logger.warning(f"Нет изображения для карты квинтэссенции: {card_name}")
+
+    if sections['general_answer']:
+        answer_translated = translate_card_names(sections['general_answer'], translations)
+        if len(answer_translated) > 4096:
+            for i in range(0, len(answer_translated), 4096):
+                await update.message.reply_text(answer_translated[i:i+4096])
+        else:
+            await update.message.reply_text(answer_translated)
+
+    if sections['extra']:
+        extra_translated = translate_card_names(sections['extra'], translations)
+        if len(extra_translated) > 4096:
+            for i in range(0, len(extra_translated), 4096):
+                await update.message.reply_text(extra_translated[i:i+4096])
+        else:
+            await update.message.reply_text(extra_translated)
+
+# ========== АНИМАЦИЯ ПРИ ГЕНЕРАЦИИ ==========
+async def show_animation(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str):
+    """Показывает анимацию "Тасую колоду...", "Вытягиваю карты...", "Читаю символы...", пока генерируется ответ."""
+    chat_id = update.effective_chat.id
+    # Отправляем первое сообщение
+    message = await context.bot.send_message(chat_id, "Тасую колоду...")
+    await asyncio.sleep(13)
+    await message.edit_text("Вытягиваю карты...")
+    await asyncio.sleep(13)
+    await message.edit_text("Читаю символы...")
+    return message  # вернём объект сообщения, чтобы потом удалить
+
 # ========== ЦЕНТРАЛИЗОВАННАЯ ПРОВЕРКА ==========
-async def can_start_session(user_id, db, context, is_free=False):
+async def can_start_session(user_id, db, context):
+    if await db.is_banned(user_id):
+        return False, "banned", "Ваш доступ к боту ограничен. Если вы считаете это ошибкой, свяжитесь с администратором."
+
     if context.user_data.get('state') == 'awaiting_question':
-        return False, "У вас уже есть активная сессия. Завершите её или задайте вопрос."
+        return False, "active", "У вас уже есть активная сессия. Завершите её или задайте вопрос."
 
     last_end = await db.get_last_session_end(user_id)
     if last_end and (time.time() - last_end) < COOLDOWN_SECONDS:
         remaining = COOLDOWN_SECONDS - (time.time() - last_end)
         hours = int(remaining // 3600)
         minutes = int((remaining % 3600) // 60)
-        return False, f"🌙 Картам нужно время, чтобы их образы улеглись в душе.\nСледующий расклад будет доступен через {hours} ч {minutes} мин.\nПриходите позже — мудрость не терпит спешки."
+        return False, "cooldown", remaining, f"🌙 Следующий расклад будет доступен через {hours} ч {minutes} мин."
 
-    if is_free:
-        free_used = await db.is_free_used(user_id)
-        if free_used:
-            return False, "Вы уже использовали бесплатную сессию."
-
-    return True, None
+    return True, None, None, None
 
 # ========== ОБРАБОТЧИКИ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -470,6 +670,47 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=START_KEYBOARD
     )
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    is_admin = AUTHOR_CHAT_ID and user_id == int(AUTHOR_CHAT_ID) if AUTHOR_CHAT_ID else False
+
+    if is_admin:
+        help_text = """
+🤖 **Доступные команды:**
+
+/start - Начать работу с ботом
+/help - Показать это сообщение
+
+**Для пользователей:**
+Начать сессию - кнопка или команда /start
+
+**Административные команды:**
+/test [вопрос] - Тестовый расклад (если вопрос не указан, бот запросит его)
+/stats - Показать статистику
+/broadcast <текст> - Рассылка всем пользователям
+/set_cooldown <часы> - Установить время кулдауна
+/ban <user_id> [причина] - Забанить пользователя
+/unban <user_id> - Разбанить пользователя
+/resetdb - Сброс базы данных (требует подтверждения)
+        """
+    else:
+        help_text = """
+🔮 **Как пользоваться ботом:**
+
+1. Нажмите кнопку «Начать сессию» или используйте /start
+2. Если перерыв активен, нужно подождать или оплатить снятие ограничения.
+3. После окончания перерыва (или если его нет) нажмите «Начать расклад» и задайте вопрос.
+4. Получите расклад из трёх карт с подробным разбором.
+5. После расклада включается перерыв на 24 часа.
+
+**Команды:**
+/start - Начать сессию или сбросить текущую
+/help - Показать эту справку
+
+Если у вас возникли вопросы или проблемы, свяжитесь с администратором.
+        """
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
 async def start_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
@@ -477,74 +718,60 @@ async def start_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await db.get_or_create_user(user_id)
 
-    can, msg = await can_start_session(user_id, db, context, is_free=False)
+    can, reason, remaining, msg = await can_start_session(user_id, db, context)
     if not can:
-        await update.message.reply_text(msg, reply_markup=START_KEYBOARD)
+        if reason == "cooldown" and is_payment_configured():
+            # Отправляем сообщение с оставшимся временем и инвойс
+            await update.message.reply_text(
+                f"{msg}\n\nВы можете сделать расклад без ожидания за {PRICE/100} {CURRENCY}."
+            )
+            await send_invoice(chat_id, context, payload="cooldown_bypass")
+        else:
+            # Другая причина (бан, активная сессия) – просто сообщаем
+            await update.message.reply_text(msg, reply_markup=START_KEYBOARD)
         return
 
-    if FREE_CONSULTATION_ENABLED and not await db.is_free_used(user_id):
-        await update.message.reply_text(
-            FREE_CONSULTATION_TEXT,
-            parse_mode='Markdown',
-            reply_markup=FREE_KEYBOARD
-        )
-        return
+    # Кулдаун не активен – показываем описание и кнопку "Начать расклад"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔮 Начать расклад", callback_data="start_tarot")]
+    ])
+    await update.message.reply_text(DESCRIPTION_TEXT, parse_mode='Markdown', reply_markup=keyboard)
 
-    if is_payment_configured():
-        service_text = (
-            "✨ Я — виртуальный таролог.✨\n\n"
-            "Я работаю с классической колодой Райдера—Уэйта и глубокой символикой.\n\n"
-            "Как проходит сеанс:\n"
-            "1. Вы задаёте любой вопрос (отношения, работа, выбор, саморазвитие).\n"
-            "2. Я вытягиваю для вас 3 случайные карты Таро.\n"
-            "3. Даю подробный разбор:\n"
-            "• значение каждой карты (символы, детали, смысл)\n"
-            "• их взаимодействие друг с другом\n"
-            "• общий синтез — ответ на ваш вопрос\n"
-            "4. При необходимости — итоговая карта-квинтэссенция.\n\n"
-            "Карты — не предсказание, а зеркало вашей души.\n"
-            "Я помогаю увидеть скрытые грани ситуации, найти ресурсы и принять осознанное решение.\n\n"
-            f"💰 Стоимость одного расклада — {PRICE/100} {CURRENCY}\n\n"
-            "Сразу после оплаты вы сможете задать свой вопрос.\n\n"
-            "Готовы заглянуть в себя? 🔮"
-        )
-        await update.message.reply_text(service_text, parse_mode='Markdown')
-        await send_invoice(chat_id, context)
-        return
-
-    await start_session_core(chat_id, user_id, context, is_free=False)
-
-async def free_consultation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_tarot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     chat_id = query.message.chat_id
     db: Database = context.bot_data['db']
 
-    can, msg = await can_start_session(user_id, db, context, is_free=True)
+    # Повторно проверим кулдаун
+    can, reason, remaining, msg = await can_start_session(user_id, db, context)
     if not can:
         await query.edit_message_text(msg)
         return
 
-    await db.set_free_used(user_id)
-    await query.edit_message_text("Начинаем бесплатную сессию...")
-    await start_session_core(chat_id, user_id, context, is_free=True)
+    # Удаляем сообщение с описанием и кнопкой
+    await query.delete_message()
 
-async def start_session_core(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, is_free: bool):
+    # Отправляем "Начинаем расклад..." и сразу удаляем через 2 секунды
+    start_msg = await context.bot.send_message(chat_id, "Начинаем расклад...")
+    await asyncio.sleep(2)
+    await start_msg.delete()
+
+    # Генерируем приветствие от AI
     if USE_AI_WELCOME:
         welcome = await generate_welcome_message()
     else:
         welcome = get_default_welcome()
 
-    await context.bot.send_message(
-        chat_id, welcome,
-        reply_markup=ReplyKeyboardMarkup([["Завершить сессию"]], resize_keyboard=True)
-    )
+    # Отправляем приветствие
+    await context.bot.send_message(chat_id, welcome)
+
+    # Устанавливаем состояние ожидания вопроса
     context.user_data['state'] = 'awaiting_question'
     context.user_data['user_id'] = user_id
     context.user_data['chat_id'] = chat_id
     context.user_data['history'] = []
-    context.user_data['is_free_session'] = is_free
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
@@ -552,6 +779,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     db: Database = context.bot_data['db']
 
+    # Проверка бана
+    if await db.is_banned(user_id):
+        await update.message.reply_text("Ваш доступ к боту ограничен. Если вы считаете это ошибкой, свяжитесь с администратором.")
+        return
+
+    # Обработка тестового вопроса
+    if context.user_data.get('awaiting_test_question'):
+        question = user_message
+        context.user_data.pop('awaiting_test_question', None)
+        await perform_test_spread(update, context, question)
+        return
+
+    # Обработка отзыва
     if context.user_data.get('state') == 'awaiting_feedback':
         feedback = user_message
         if AUTHOR_CHAT_ID:
@@ -566,6 +806,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['state'] = 'idle'
         return
 
+    # Завершение сессии
     if user_message == "Завершить сессию":
         if context.user_data.get('state') == 'awaiting_question':
             context.user_data.clear()
@@ -578,6 +819,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # Обработка вопроса во время сессии
     if context.user_data.get('state') == 'awaiting_question':
         if context.user_data.get('user_id') != user_id:
             await update.message.reply_text(
@@ -586,78 +828,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        await context.bot.send_chat_action(chat_id, action="typing")
+        # Запускаем анимацию и получаем объект сообщения
+        animation_msg = await show_animation(update, context, user_message)
 
+        # Запрашиваем AI
         history = context.user_data.get('history', [])
         answer = await ask_ai(user_message, history)
 
+        # Удаляем анимацию
+        try:
+            await animation_msg.delete()
+        except Exception as e:
+            logger.error(f"Ошибка удаления анимации: {e}")
+
+        # Сохраняем историю
         history.append({"role": "user", "content": user_message})
         history.append({"role": "assistant", "content": answer})
         if len(history) > 10:
             history = history[-10:]
         context.user_data['history'] = history
 
-        # Парсим и отправляем с картинками
-        intro, cards_section, card_details, rest = parse_ai_response(answer)
+        # Отправляем ответ
+        await send_ai_response(update, context, answer)
 
-        translations = context.bot_data.get('translations', {})
-        card_images = context.bot_data.get('card_images', {})
-
-        if intro is None:
-            # Не удалось распарсить – отправляем как есть
-            if len(answer) > 4096:
-                for i in range(0, len(answer), 4096):
-                    await update.message.reply_text(answer[i:i+4096])
-            else:
-                await update.message.reply_text(answer)
-        else:
-            # 1. Вступление + список карт (перевод)
-            first_part = translate_card_names(intro, translations)
-            if cards_section:
-                first_part += f"\n\n**Выпавшие карты:**\n{translate_card_names(cards_section, translations)}"
-            await update.message.reply_text(first_part)
-
-            # 2. Для каждой карты: фото + описание (перевод)
-            for eng_name, description in card_details:
-                rus_name = translations.get(eng_name, eng_name)
-                file_id = card_images.get(eng_name)
-                if file_id:
-                    try:
-                        await context.bot.send_photo(chat_id=chat_id, photo=file_id, caption=rus_name)
-                    except Exception as e:
-                        logger.error(f"Ошибка отправки фото для {eng_name}: {e}")
-                else:
-                    logger.warning(f"Нет изображения для карты: {eng_name}")
-
-                if description:
-                    desc_translated = translate_card_names(description, translations)
-                    if len(desc_translated) > 4096:
-                        for i in range(0, len(desc_translated), 4096):
-                            await update.message.reply_text(desc_translated[i:i+4096])
-                    else:
-                        await update.message.reply_text(desc_translated)
-
-            # 3. Остаток (синтез, квинтэссенция, общий ответ) – перевод
-            if rest:
-                rest_translated = translate_card_names(rest, translations)
-                if len(rest_translated) > 4096:
-                    for i in range(0, len(rest_translated), 4096):
-                        await update.message.reply_text(rest_translated[i:i+4096])
-                else:
-                    await update.message.reply_text(rest_translated)
-
+        # Обновляем данные сессии
         try:
             await db.update_last_session_end(user_id)
+            await db.log_session(user_id, user_message)
         except Exception as e:
-            logger.error(f"Ошибка обновления last_session_end: {e}")
-        finally:
-            context.user_data.clear()
-            context.user_data['state'] = 'idle'
+            logger.error(f"Ошибка обновления данных сессии: {e}")
 
+        # Завершаем сессию
+        context.user_data.clear()
+        context.user_data['state'] = 'idle'
         await update.message.reply_text("✨", reply_markup=START_KEYBOARD)
         await ask_feedback(chat_id, context)
         return
 
+    # Если ничего не подошло
     await update.message.reply_text(
         "Сейчас нет активной сессии. Нажмите «Начать сессию».",
         reply_markup=START_KEYBOARD
@@ -684,18 +892,146 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_id = update.effective_chat.id
     db: Database = context.bot_data['db']
 
-    can, msg = await can_start_session(user_id, db, context, is_free=False)
-    if not can:
-        await update.message.reply_text(msg)
-        return
+    await db.get_or_create_user(user_id)
 
+    # После оплаты сразу запускаем сессию (кулдаун игнорируется)
+    # Отправляем сообщение об успехе
     await update.message.reply_text(
         "✅ Оплата прошла успешно! Начинаем сеанс.",
         reply_markup=ReplyKeyboardMarkup([["Завершить сессию"]], resize_keyboard=True)
     )
-    await start_session_core(chat_id, user_id, context, is_free=False)
 
-# ========== КОМАНДА СБРОСА БД ==========
+    # Удаляем старую клавиатуру? Не обязательно.
+    # Далее повторяем логику start_tarot_callback: удаляем предыдущее сообщение (если есть),
+    # но здесь сообщение уже новое, поэтому просто запускаем приветствие.
+    start_msg = await context.bot.send_message(chat_id, "Начинаем расклад...")
+    await asyncio.sleep(2)
+    await start_msg.delete()
+
+    if USE_AI_WELCOME:
+        welcome = await generate_welcome_message()
+    else:
+        welcome = get_default_welcome()
+
+    await context.bot.send_message(chat_id, welcome)
+    context.user_data['state'] = 'awaiting_question'
+    context.user_data['user_id'] = user_id
+    context.user_data['chat_id'] = chat_id
+    context.user_data['history'] = []
+    # Клавиатура "Завершить сессию" уже отправлена
+
+# ========== АДМИНИСТРАТИВНЫЕ КОМАНДЫ ==========
+async def test_spread(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if AUTHOR_CHAT_ID and user_id != int(AUTHOR_CHAT_ID):
+        await update.message.reply_text("⛔ Недостаточно прав.")
+        return
+
+    if context.args:
+        question = " ".join(context.args)
+        await perform_test_spread(update, context, question)
+    else:
+        context.user_data['awaiting_test_question'] = True
+        await update.message.reply_text("🧪 Введите ваш вопрос для тестового расклада:")
+
+async def perform_test_spread(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str):
+    await update.message.reply_text(f"🧪 Тестовый расклад для вопроса:\n{question}\n\nГенерирую...")
+    history = []
+    answer = await ask_ai(question, history)
+    await send_ai_response(update, context, answer)
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if AUTHOR_CHAT_ID and user_id != int(AUTHOR_CHAT_ID):
+        await update.message.reply_text("⛔ Недостаточно прав.")
+        return
+
+    db: Database = context.bot_data['db']
+    stats_data = await db.get_stats()
+    text = (
+        f"📊 **Статистика бота**\n\n"
+        f"👥 Всего пользователей: {stats_data['total_users']}\n"
+        f"🔮 Всего сессий: {stats_data['total_sessions']}\n"
+        f"🚫 Забаненных: {stats_data['banned_users']}\n"
+    )
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if AUTHOR_CHAT_ID and user_id != int(AUTHOR_CHAT_ID):
+        await update.message.reply_text("⛔ Недостаточно прав.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /broadcast <текст сообщения>")
+        return
+
+    message_text = " ".join(context.args)
+    db: Database = context.bot_data['db']
+    users = await db.get_all_users()
+
+    await update.message.reply_text(f"📢 Начинаю рассылку {len(users)} пользователям...")
+    success = 0
+    fail = 0
+    for uid in users:
+        try:
+            await context.bot.send_message(uid, message_text)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            fail += 1
+            logger.error(f"Ошибка отправки пользователю {uid}: {e}")
+    await update.message.reply_text(f"✅ Рассылка завершена. Успешно: {success}, ошибок: {fail}")
+
+async def set_cooldown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if AUTHOR_CHAT_ID and user_id != int(AUTHOR_CHAT_ID):
+        await update.message.reply_text("⛔ Недостаточно прав.")
+        return
+
+    if not context.args or len(context.args) != 1:
+        await update.message.reply_text("Использование: /set_cooldown <часы>")
+        return
+
+    try:
+        hours = float(context.args[0])
+        global COOLDOWN_SECONDS
+        COOLDOWN_SECONDS = int(hours * 3600)
+        await update.message.reply_text(f"✅ Кулдаун установлен на {hours} часов ({COOLDOWN_SECONDS} секунд).")
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат. Введите число часов.")
+
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if AUTHOR_CHAT_ID and user_id != int(AUTHOR_CHAT_ID):
+        await update.message.reply_text("⛔ Недостаточно прав.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /ban <user_id> [причина]")
+        return
+
+    target_id = int(context.args[0])
+    reason = " ".join(context.args[1:]) if len(context.args) > 1 else None
+    db: Database = context.bot_data['db']
+    await db.ban_user(target_id, reason)
+    await update.message.reply_text(f"🚫 Пользователь {target_id} забанен.\nПричина: {reason or 'не указана'}")
+
+async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if AUTHOR_CHAT_ID and user_id != int(AUTHOR_CHAT_ID):
+        await update.message.reply_text("⛔ Недостаточно прав.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /unban <user_id>")
+        return
+
+    target_id = int(context.args[0])
+    db: Database = context.bot_data['db']
+    await db.unban_user(target_id)
+    await update.message.reply_text(f"✅ Пользователь {target_id} разбанен.")
+
 async def resetdb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if AUTHOR_CHAT_ID and update.effective_user.id != int(AUTHOR_CHAT_ID):
         await update.message.reply_text("⛔ Недостаточно прав для выполнения этой команды.")
@@ -752,11 +1088,19 @@ async def main():
             await app.bot.delete_webhook()
             await asyncio.sleep(1)
 
+        # Регистрация обработчиков
         app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("test", test_spread))
+        app.add_handler(CommandHandler("stats", stats))
+        app.add_handler(CommandHandler("broadcast", broadcast))
+        app.add_handler(CommandHandler("set_cooldown", set_cooldown))
+        app.add_handler(CommandHandler("ban", ban))
+        app.add_handler(CommandHandler("unban", unban))
         app.add_handler(CommandHandler("resetdb", resetdb))
         app.add_handler(CommandHandler("resetdb_confirm", resetdb_confirm))
         app.add_handler(MessageHandler(filters.Regex("^Начать сессию$"), start_session))
-        app.add_handler(CallbackQueryHandler(free_consultation_callback, pattern="^free_consultation$"))
+        app.add_handler(CallbackQueryHandler(start_tarot_callback, pattern="^start_tarot$"))
         app.add_handler(PreCheckoutQueryHandler(pre_checkout))
         app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
         app.add_handler(CallbackQueryHandler(feedback_callback, pattern="^feedback_"))
