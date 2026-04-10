@@ -31,7 +31,7 @@ load_dotenv()
 # ========== НАСТРОЙКИ ==========
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
-DATABASE_URL = os.getenv('DATABASE_URL')
+DATABASE_URL = "postgresql://bothost_db_cbcd8800f736:4wmdt2Vq1CY2ykdFwQGh8eMwzJ-MnOAEgRyigtvP73g@node1.pghost.ru:15496/bothost_db_cbcd8800f736"
 PAYMENT_PROVIDER_TOKEN = os.getenv('PAYMENT_PROVIDER_TOKEN')
 CURRENCY = os.getenv('CURRENCY', 'RUB')
 PRICE = int(os.getenv('PRICE', 10000))
