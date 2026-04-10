@@ -7,6 +7,7 @@ import signal
 import logging
 import fcntl
 import re
+import random  # <-- добавлено для случайного выбора карт
 import openai
 import asyncpg
 from dotenv import load_dotenv
@@ -40,7 +41,7 @@ AUTHOR_CHAT_ID = os.getenv('AUTHOR_CHAT_ID')
 USE_AI_WELCOME = os.getenv('USE_AI_WELCOME', 'True').lower() in ('true', '1', 'yes')
 PAYMENT_ENABLED = os.getenv('PAYMENT_ENABLED', 'False').lower() in ('true', '1', 'yes')
 
-COOLDOWN_SECONDS = 24 * 60 * 60   # 12 часов
+COOLDOWN_SECONDS = 24 * 60 * 60   # 24 часа
 
 DESCRIPTION_TEXT = (
     "✨ Я — виртуальный таролог.✨\n\n"
@@ -60,15 +61,16 @@ DESCRIPTION_TEXT = (
 
 START_KEYBOARD = ReplyKeyboardMarkup([["Начать сессию"]], resize_keyboard=True)
 
-# ========== СИСТЕМНЫЙ ПРОМПТ (английские названия, строгая структура) ==========
+# ========== НОВЫЙ СИСТЕМНЫЙ ПРОМПТ (без инструкции о случайном выборе) ==========
 SYSTEM_PROMPT = """
 Ты — профессиональный таролог, специализирующийся на колоде Райдера—Уэйта. Твоя интерпретация опирается на глубокое знание символики, изложенное в книге Эвелин Бюргер и Йоханнеса Фибиг «Символика под микроскопом». Ты понимаешь, что каждая карта имеет и положительное, и отрицательное значение, является зеркалом души кверента и может быть рассмотрена как на субъективном (внутренние процессы), так и на объективном (внешние события) уровнях.
 
-**ВАЖНОЕ ПРАВИЛО:** Все названия карт пиши **на английском языке**, как в оригинальной колоде (например: The Fool, The Magician, Two of Cups, Ten of Wands, Queen of Pentacles и т.д.).
+**ВАЖНОЕ ПРАВИЛО:** Все названия карт пиши **на английском языке**, как в оригинальной колоде (например: The Fool, The Magician, Two of Cups, Ten of Wands, Queen of Pentacles и т.д.). Для числовых карт используй слова (Two, Three, Four, Five, Six, Seven, Eight, Nine, Ten), а не цифры.
 
 **Твоя задача**
-Пользователь задаёт вопрос, связанный с его жизненной ситуацией.
-Ты сам случайным образом выбираешь три карты из полного списка колоды Таро (78 карт: 22 Старших аркана и 56 Младших арканов четырёх мастей — Wands, Cups, Swords, Pentacles). Используй равновероятный случайный выбор. После этого ты должен:
+Пользователь задаёт вопрос, а бот предоставляет три случайные карты. Ты должен интерпретировать **именно эти три карты** (они будут перечислены в сообщении пользователя после слов "Выпавшие карты:").
+
+После этого ты должен:
 
 1. Назвать три выпавшие карты — указать их название **на английском** (и масть для Младших арканов).
 2. Кратко представить каждую карту — описать ключевые символы и основное значение, выделив как позитивные, так и негативные аспекты (если они уместны в контексте вопроса).
@@ -103,44 +105,12 @@ SYSTEM_PROMPT = """
 - Избегай сухих перечислений. Пусть твой язык будет плавным, поэтичным, но при этом понятным.
 - Обращайся к пользователю на «вы» (уважительно).
 
-**Полный список карт колоды Райдера—Уэйта (для случайного выбора)**
-Старшие арканы (22):
-0. The Fool
-I. The Magician
-II. The High Priestess
-III. The Empress
-IV. The Emperor
-V. The Hierophant
-VI. The Lovers
-VII. The Chariot
-VIII. Strength
-IX. The Hermit
-X. Wheel of Fortune
-XI. Justice
-XII. The Hanged Man
-XIII. Death
-XIV. Temperance
-XV. The Devil
-XVI. The Tower
-XVII. The Star
-XVIII. The Moon
-XIX. The Sun
-XX. Judgment
-XXI. The World
-
-Младшие арканы (56):
-Wands (fire, will): Ace, 2, 3, 4, 5, 6, 7, 8, 9, 10, Page, Knight, Queen, King.
-Cups (water, emotions): Ace, 2, 3, 4, 5, 6, 7, 8, 9, 10, Page, Knight, Queen, King.
-Swords (air, intellect): Ace, 2, 3, 4, 5, 6, 7, 8, 9, 10, Page, Knight, Queen, King.
-Pentacles (earth, material): Ace, 2, 3, 4, 5, 6, 7, 8, 9, 10, Page, Knight, Queen, King.
-
 **Пример начала работы бота**
-После получения вопроса пользователя бот (ты) мысленно выбирает три случайные карты из списка, затем отвечает по шаблону:
+После получения вопроса и списка карт бот отвечает по шаблону:
 
 «Я вытянул для вас три карты. Их сочетание напоминает древнюю притчу: сначала герой встречает тьму, затем находит опору, а в конце обретает свет. Давайте посмотрим, что они говорят…»
 
 **Дополнительная инструкция для ИИ**
-- При случайном выборе используй равномерное распределение: все 78 карт равновероятны.
 - Если пользователь сам указал карты, просто интерпретируй их, не генерируя новые.
 - Если пользователь задал вопрос без уточнения схемы, можешь интерпретировать три карты как «ситуация – вызов – путь» или «прошлое – настоящее – будущее», указав, какую схему ты применяешь.
 - Будь внимателен: для придворных карт (Page, Knight, Queen, King) числовое значение для квинтэссенции — 0. Для Ace — 1. Для остальных числовых карт — число от 2 до 10. Для Старших арканов — их номер (для The Fool — 0).
@@ -289,6 +259,17 @@ class Database:
             await self.init_tables()
         logger.info("База данных сброшена")
 
+# ========== ФУНКЦИЯ ДЛЯ СЛУЧАЙНЫХ КАРТ ==========
+async def get_random_cards(context: ContextTypes.DEFAULT_TYPE, count: int = 3) -> list:
+    """Возвращает список случайных карт (английские названия) из полной колоды."""
+    tarot_cards = context.bot_data.get('tarot_cards')
+    if not tarot_cards:
+        # fallback – загружаем из файла
+        translations = load_translations()
+        tarot_cards = list(translations.keys())
+        context.bot_data['tarot_cards'] = tarot_cards
+    return random.sample(tarot_cards, count)
+
 # ========== AI ФУНКЦИИ ==========
 async def generate_welcome_message():
     welcome_prompt = "Ты — виртуальный таролог. Предложи пользователю задать вопрос. Объясни, что чем подробнее и детальнее он опишет свой вопрос, тем точнее будет расклад. Не используй Markdown."
@@ -317,11 +298,17 @@ def get_default_welcome():
             "Чтобы образы и символы заговорили с вами максимально ясно, пожалуйста, опишите вашу ситуацию или вопрос как можно подробнее. "
             "Чем больше деталей вы предоставите, тем глубже и точнее будет наше совместное путешествие к пониманию. Я жду вашего вопроса.")
 
-async def ask_ai(question, history):
+async def ask_ai(question: str, history: list, cards: list = None):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for msg in history:
         messages.append(msg)
-    messages.append({"role": "user", "content": question})
+    
+    # Формируем сообщение пользователя: вопрос + список карт (если есть)
+    user_content = question
+    if cards:
+        user_content = f"Вопрос: {question}\n\nВыпавшие карты: {', '.join(cards)}.\n\nПожалуйста, выполните расклад."
+    messages.append({"role": "user", "content": user_content})
+    
     try:
         response = await asyncio.wait_for(
             asyncio.to_thread(
@@ -638,13 +625,12 @@ async def send_ai_response(update: Update, context: ContextTypes.DEFAULT_TYPE, a
 async def show_animation(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str):
     """Показывает анимацию "Тасую колоду...", "Вытягиваю карты...", "Читаю символы...", пока генерируется ответ."""
     chat_id = update.effective_chat.id
-    # Отправляем первое сообщение
     message = await context.bot.send_message(chat_id, "Тасую колоду...")
     await asyncio.sleep(13)
     await message.edit_text("Вытягиваю карты...")
-    await asyncio.sleep(13)
+    await asyncio.sleep(10)
     await message.edit_text("Читаю символы...")
-    return message  # вернём объект сообщения, чтобы потом удалить
+    return message
 
 # ========== ЦЕНТРАЛИЗОВАННАЯ ПРОВЕРКА ==========
 async def can_start_session(user_id, db, context):
@@ -721,17 +707,14 @@ async def start_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     can, reason, remaining, msg = await can_start_session(user_id, db, context)
     if not can:
         if reason == "cooldown" and is_payment_configured():
-            # Отправляем сообщение с оставшимся временем и инвойс
             await update.message.reply_text(
                 f"{msg}\n\nВы можете сделать расклад без ожидания за {PRICE/100} {CURRENCY}."
             )
             await send_invoice(chat_id, context, payload="cooldown_bypass")
         else:
-            # Другая причина (бан, активная сессия) – просто сообщаем
             await update.message.reply_text(msg, reply_markup=START_KEYBOARD)
         return
 
-    # Кулдаун не активен – показываем описание и кнопку "Начать расклад"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔮 Начать расклад", callback_data="start_tarot")]
     ])
@@ -744,30 +727,24 @@ async def start_tarot_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = query.message.chat_id
     db: Database = context.bot_data['db']
 
-    # Повторно проверим кулдаун
     can, reason, remaining, msg = await can_start_session(user_id, db, context)
     if not can:
         await query.edit_message_text(msg)
         return
 
-    # Удаляем сообщение с описанием и кнопкой
     await query.delete_message()
 
-    # Отправляем "Начинаем расклад..." и сразу удаляем через 2 секунды
     start_msg = await context.bot.send_message(chat_id, "Начинаем расклад...")
     await asyncio.sleep(2)
     await start_msg.delete()
 
-    # Генерируем приветствие от AI
     if USE_AI_WELCOME:
         welcome = await generate_welcome_message()
     else:
         welcome = get_default_welcome()
 
-    # Отправляем приветствие
     await context.bot.send_message(chat_id, welcome)
 
-    # Устанавливаем состояние ожидания вопроса
     context.user_data['state'] = 'awaiting_question'
     context.user_data['user_id'] = user_id
     context.user_data['chat_id'] = chat_id
@@ -779,19 +756,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     db: Database = context.bot_data['db']
 
-    # Проверка бана
     if await db.is_banned(user_id):
         await update.message.reply_text("Ваш доступ к боту ограничен. Если вы считаете это ошибкой, свяжитесь с администратором.")
         return
 
-    # Обработка тестового вопроса
     if context.user_data.get('awaiting_test_question'):
         question = user_message
         context.user_data.pop('awaiting_test_question', None)
         await perform_test_spread(update, context, question)
         return
 
-    # Обработка отзыва
     if context.user_data.get('state') == 'awaiting_feedback':
         feedback = user_message
         if AUTHOR_CHAT_ID:
@@ -806,7 +780,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['state'] = 'idle'
         return
 
-    # Завершение сессии
     if user_message == "Завершить сессию":
         if context.user_data.get('state') == 'awaiting_question':
             context.user_data.clear()
@@ -819,7 +792,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # Обработка вопроса во время сессии
     if context.user_data.get('state') == 'awaiting_question':
         if context.user_data.get('user_id') != user_id:
             await update.message.reply_text(
@@ -828,44 +800,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Запускаем анимацию и получаем объект сообщения
+        # Генерируем три случайные карты ДО вызова AI
+        cards = await get_random_cards(context, 3)
+
         animation_msg = await show_animation(update, context, user_message)
 
-        # Запрашиваем AI
         history = context.user_data.get('history', [])
-        answer = await ask_ai(user_message, history)
+        answer = await ask_ai(user_message, history, cards)
 
-        # Удаляем анимацию
         try:
             await animation_msg.delete()
         except Exception as e:
             logger.error(f"Ошибка удаления анимации: {e}")
 
-        # Сохраняем историю
         history.append({"role": "user", "content": user_message})
         history.append({"role": "assistant", "content": answer})
         if len(history) > 10:
             history = history[-10:]
         context.user_data['history'] = history
 
-        # Отправляем ответ
         await send_ai_response(update, context, answer)
 
-        # Обновляем данные сессии
         try:
             await db.update_last_session_end(user_id)
             await db.log_session(user_id, user_message)
         except Exception as e:
             logger.error(f"Ошибка обновления данных сессии: {e}")
 
-        # Завершаем сессию
         context.user_data.clear()
         context.user_data['state'] = 'idle'
         await update.message.reply_text("✨", reply_markup=START_KEYBOARD)
         await ask_feedback(chat_id, context)
         return
 
-    # Если ничего не подошло
     await update.message.reply_text(
         "Сейчас нет активной сессии. Нажмите «Начать сессию».",
         reply_markup=START_KEYBOARD
@@ -894,16 +861,11 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await db.get_or_create_user(user_id)
 
-    # После оплаты сразу запускаем сессию (кулдаун игнорируется)
-    # Отправляем сообщение об успехе
     await update.message.reply_text(
         "✅ Оплата прошла успешно! Начинаем сеанс.",
         reply_markup=ReplyKeyboardMarkup([["Завершить сессию"]], resize_keyboard=True)
     )
 
-    # Удаляем старую клавиатуру? Не обязательно.
-    # Далее повторяем логику start_tarot_callback: удаляем предыдущее сообщение (если есть),
-    # но здесь сообщение уже новое, поэтому просто запускаем приветствие.
     start_msg = await context.bot.send_message(chat_id, "Начинаем расклад...")
     await asyncio.sleep(2)
     await start_msg.delete()
@@ -918,7 +880,6 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data['user_id'] = user_id
     context.user_data['chat_id'] = chat_id
     context.user_data['history'] = []
-    # Клавиатура "Завершить сессию" уже отправлена
 
 # ========== АДМИНИСТРАТИВНЫЕ КОМАНДЫ ==========
 async def test_spread(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -936,8 +897,8 @@ async def test_spread(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def perform_test_spread(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str):
     await update.message.reply_text(f"🧪 Тестовый расклад для вопроса:\n{question}\n\nГенерирую...")
-    history = []
-    answer = await ask_ai(question, history)
+    cards = await get_random_cards(context, 3)
+    answer = await ask_ai(question, [], cards)
     await send_ai_response(update, context, answer)
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1074,11 +1035,13 @@ async def main():
 
         card_images = load_card_images()
         translations = load_translations()
+        tarot_cards = list(translations.keys())  # список всех карт для случайного выбора
 
         app = Application.builder().token(TELEGRAM_TOKEN).build()
         app.bot_data['db'] = db
         app.bot_data['card_images'] = card_images
         app.bot_data['translations'] = translations
+        app.bot_data['tarot_cards'] = tarot_cards
 
         await app.bot.delete_webhook()
         await asyncio.sleep(1)
@@ -1088,7 +1051,6 @@ async def main():
             await app.bot.delete_webhook()
             await asyncio.sleep(1)
 
-        # Регистрация обработчиков
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("help", help_command))
         app.add_handler(CommandHandler("test", test_spread))
